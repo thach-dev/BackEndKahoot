@@ -2,16 +2,15 @@
 const { supabase } = require("../config/supabase");
 
 async function getQuizForHost(quizId, ownerId) {
-  if (!quizId || !ownerId) {
-    throw new Error("Thiếu quizId hoặc ownerId.");
+  if (!quizId) {
+    throw new Error("Thiếu mã bài quiz.");
   }
 
-  // 1. Lấy quiz và kiểm tra quyền sở hữu
+  // 1. Lấy quiz theo ID, không giới hạn người sở hữu
   const { data: quiz, error: quizError } = await supabase
     .from("quiz_games")
     .select("id, owner_id, title, created_at")
     .eq("id", quizId)
-    .eq("owner_id", ownerId)
     .maybeSingle();
 
   if (quizError) {
@@ -20,28 +19,30 @@ async function getQuizForHost(quizId, ownerId) {
   }
 
   if (!quiz) {
-    throw new Error(
-      "Không tìm thấy bài quiz hoặc tài khoản hiện tại không sở hữu bài quiz này."
-    );
+    throw new Error("Không tìm thấy bài quiz.");
   }
 
-  // 2. Lấy câu hỏi từ đúng bảng quiz_questions
+  // 2. Lấy câu hỏi theo ID của quiz
   const { data: questions, error: questionsError } = await supabase
     .from("quiz_questions")
-    .select("*")
+    .select(
+      "id, game_id, question_text, answers, correct_answer, time_limit, points, question_order"
+    )
     .eq("game_id", quizId)
     .order("question_order", { ascending: true });
 
   if (questionsError) {
     console.error("GET QUESTIONS ERROR:", questionsError);
-    throw new Error(`Không thể lấy câu hỏi: ${questionsError.message}`);
+    throw new Error(
+      `Không thể lấy câu hỏi: ${questionsError.message}`
+    );
   }
 
   if (!questions || questions.length === 0) {
     throw new Error("Bài quiz này chưa có câu hỏi.");
   }
 
-  // 3. Chuẩn hóa câu hỏi cho Socket.IO
+  // 3. Chuẩn hóa dữ liệu cho Socket.IO
   return {
     ...quiz,
     questions: questions.map((q) => ({
@@ -55,4 +56,6 @@ async function getQuizForHost(quizId, ownerId) {
   };
 }
 
-module.exports = { getQuizForHost };
+module.exports = {
+  getQuizForHost,
+};
