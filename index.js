@@ -4,6 +4,7 @@ require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
 const { Server } = require("socket.io");
 
 const registerQuizSocket = require("./sockets/quizSocket");
@@ -32,16 +33,67 @@ const io = new Server(server, {
   },
 });
 
-// Đăng ký các sự kiện Socket.IO
-const quizSocket = registerQuizSocket(io);
+// ==========================================
+// JWT AUTHENTICATION FOR SOCKET.IO
+// ==========================================
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
 
-app.get("/rooms-status", (_req, res) => {
-  res.json({
-    success: true,
-    ...quizSocket.getRoomStatus(),
-  });
+    if (!token) {
+      return next(new Error("Thiếu token đăng nhập."));
+    }
+
+    const secret = process.env.JWT_SECRET;
+
+    if (!secret) {
+      console.error(
+        "Lỗi cấu hình: chưa có biến môi trường JWT_SECRET."
+      );
+
+      return next(
+        new Error("Backend chưa cấu hình JWT_SECRET.")
+      );
+    }
+
+    const decoded = jwt.verify(token, secret);
+
+    // Hỗ trợ các tên trường ID thường gặp trong JWT.
+    const userId =
+      decoded.id ??
+      decoded.userId ??
+      decoded.user_id ??
+      decoded.sub;
+
+    if (userId === undefined || userId === null || userId === "") {
+      return next(
+        new Error("Token không chứa ID người dùng.")
+      );
+    }
+
+    socket.data.userId = String(userId);
+
+    next();
+  } catch (error) {
+    console.error(
+      "Socket JWT authentication failed:",
+      error.message
+    );
+
+    return next(
+      new Error("Token không hợp lệ hoặc đã hết hạn.")
+    );
+  }
 });
 
+// ==========================================
+// REGISTER QUIZ SOCKET EVENTS
+// ==========================================
+const quizSocket = registerQuizSocket(io);
+
+// ==========================================
+// HTTP ROUTES
+// ==========================================
 app.get("/", (_req, res) => {
   res.json({
     message: "Quiz Socket Server is running",
@@ -56,6 +108,18 @@ app.get("/health", (_req, res) => {
   });
 });
 
+app.get("/rooms-status", (_req, res) => {
+  res.json({
+    success: true,
+    ...quizSocket.getRoomStatus(),
+  });
+});
+
+// ==========================================
+// START SERVER
+// ==========================================
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Quiz Socket Server listening on port ${PORT}`);
+  console.log(
+    `Quiz Socket Server listening on port ${PORT}`
+  );
 });
