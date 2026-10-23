@@ -5,47 +5,43 @@ const express = require("express");
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
+const { randomInt } = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
-
-const PORT = process.env.PORT || 3000;
 
 const allowedOrigins = (process.env.FRONTEND_URL || "*")
   .split(",")
   .map((origin) => origin.trim());
 
-app.use(cors({ origin: allowedOrigins.includes("*") ? true : allowedOrigins }));
+const corsOrigin = allowedOrigins.includes("*")
+  ? true
+  : allowedOrigins;
+
+app.use(cors({ origin: corsOrigin }));
 app.use(express.json());
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins.includes("*") ? true : allowedOrigins,
+    origin: corsOrigin,
     methods: ["GET", "POST"],
   },
 });
 
 const rooms = new Map();
 
-app.get("/", (req, res) => {
-  res.json({
-    message: "Quiz Socket Server is running",
-    rooms: rooms.size,
-  });
-});
-
 function createPin() {
   let pin;
 
   do {
-    pin = String(Math.floor(100000 + Math.random() * 900000));
+    pin = String(randomInt(100000, 1000000));
   } while (rooms.has(pin));
 
   return pin;
 }
 
 function publicPlayers(room) {
-  return room.players.map((player) => ({
+  return [...room.players.values()].map((player) => ({
     id: player.id,
     nickname: player.nickname,
     score: player.score,
@@ -57,255 +53,319 @@ function emitPlayers(pin, room) {
 }
 
 function getRoom(pin) {
-  return rooms.get(String(pin || ""));
+  return rooms.get(String(pin || "").trim());
 }
 
-// Host tạo phòng và gửi danh sách câu hỏi
-io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+function normalizeQuestions(questions) {
+  if (!Array.isArray(questions) || questions.length === 0) {
+    throw new Error("Cần ít nhất một câu hỏi.");
+  }
 
-  socket.on("host:create", (payload = {}, callback) => {
-    const questions = payload.questions;
-
-    if (!Array.isArray(questions) || questions.length === 0) {
-      return callback?.({
-        ok: false,
-        message: "Vui lòng gửi danh sách câu hỏi.",
-      });
+  return questions.map((q) => {
+    if (
+      !q ||
+      typeof q.question !== "string" ||
+      !q.question.trim() ||
+      !Array.isArray(q.options) ||
+      q.options.length < 2 ||
+      !Number.isInteger(q.correctAnswer) ||
+      q.correctAnswer < 0 ||
+      q.correctAnswer >= q.options.length
+    ) {
+      throw new Error(
+        "Mỗi câu hỏi cần question, options và correctAnswer hợp lệ."
+      );
     }
 
-    const validQuestions = questions.filter(
-      (q) =>
-        q &&
-        typeof q.question === "string" &&
-        Array.isArray(q.options) &&
-        q.options.length >= 2 &&
-        Number.isInteger(q.correctAnswer)
-    );
-
-    if (validQuestions.length !== questions.length) {
-      return callback?.({
-        ok: false,
-        message: "Dữ liệu câu hỏi không hợp lệ.",
-      });
-    }
-
-    const pin = createPin();
-
-    const room = {
-      pin,
-      hostId: socket.id,
-      players: [],
-      questions: validQuestions,
-      currentIndex: -1,
-      started: false,
-      revealed: false,
-      answers: new Map(),
+    return {
+      question: q.question.trim(),
+      options: q.options.map(String),
+      correctAnswer: q.correctAnswer,
     };
+  });
+}
 
-    rooms.set(pin, room);
-    socket.join(pin);
-    socket.data.hostPin = pin;
+function sendCurrentQuestion(pin, room) {
+  const q = room.questions[room.currentIndex];
 
-    callback?.({ ok: true, pin });
-    console.log(`Room ${pin} created`);
+  room.answerRevealed = false;
+  room.answeredPlayers.clear();
+
+  io.to(pin).emit("question:show", {
+    index: room.currentIndex,
+    total: room.questions.length,
+    question: q.question,
+    options: q.options,
+  });
+}
+
+io.on("connection", (socket) => {
+  console.log("Socket connected:", socket.id);
+
+  // HOST: tạo phòng
+  socket.on("host:create", (data = {}, callback = () => {}) => {
+    try {
+      const questions = normalizeQuestions(data.questions);
+      const pin = createPin();
+
+      const room = {
+        pin,
+        hostId: socket.id,
+        questions,
+        currentIndex: -1,
+        started: false,
+        answerRevealed: false,
+        answeredPlayers: new Set(),
+        players: new Map(),
+      };
+
+      rooms.set(pin, room);
+      socket.join(pin);
+      socket.data.hostPin = pin;
+
+      callback({ ok: true, pin });
+      console.log(`Room ${pin} created by ${socket.id}`);
+    } catch (error) {
+      callback({ ok: false, message: error.message });
+    }
   });
 
-  socket.on("player:join", ({ pin, nickname } = {}, callback) => {
+  // PLAYER: tham gia phòng
+  socket.on("player:join", (data = {}, callback = () => {}) => {
+    const pin = String(data.pin || "").trim();
+    const nickname = String(data.nickname || "").trim().slice(0, 24);
     const room = getRoom(pin);
-    const name = String(nickname || "").trim().slice(0, 30);
 
     if (!room) {
-      return callback?.({ ok: false, message: "Phòng không tồn tại." });
+      return callback({
+        ok: false,
+        message: "Không tìm thấy phòng chơi.",
+      });
     }
 
     if (room.started) {
-      return callback?.({ ok: false, message: "Trận đấu đã bắt đầu." });
+      return callback({
+        ok: false,
+        message: "Trận đấu đã bắt đầu.",
+      });
     }
 
-    if (!name) {
-      return callback?.({ ok: false, message: "Vui lòng nhập biệt danh." });
+    if (!nickname) {
+      return callback({
+        ok: false,
+        message: "Vui lòng nhập tên người chơi.",
+      });
     }
 
-    if (room.players.some((player) => player.id === socket.id)) {
-      return callback?.({ ok: false, message: "Bạn đã vào phòng rồi." });
-    }
-
-    room.players.push({
+    const player = {
       id: socket.id,
-      nickname: name,
+      nickname,
       score: 0,
-    });
+    };
 
-    socket.join(room.pin);
-    socket.data.playerPin = room.pin;
+    room.players.set(socket.id, player);
+    socket.join(pin);
+    socket.data.playerPin = pin;
 
-    emitPlayers(room.pin, room);
-    callback?.({ ok: true, pin: room.pin });
+    callback({ ok: true, pin, nickname });
+    emitPlayers(pin, room);
+
+    console.log(`${nickname} joined room ${pin}`);
   });
 
-  socket.on("host:start", ({ pin } = {}, callback) => {
+  // HOST: bắt đầu trận đấu
+  socket.on("host:start", (data = {}, callback = () => {}) => {
+    const pin = String(data.pin || "").trim();
     const room = getRoom(pin);
 
     if (!room || room.hostId !== socket.id) {
-      return callback?.({ ok: false, message: "Bạn không phải chủ phòng." });
+      return callback({
+        ok: false,
+        message: "Bạn không phải chủ phòng.",
+      });
     }
 
     if (room.started) {
-      return callback?.({ ok: false, message: "Trận đấu đã bắt đầu." });
+      return callback({
+        ok: false,
+        message: "Trận đấu đã bắt đầu.",
+      });
     }
 
     room.started = true;
     room.currentIndex = 0;
-    room.revealed = false;
-    room.answers.clear();
 
-    io.to(room.pin).emit("game:started");
-    io.to(room.pin).emit("question:show", {
-      index: 0,
-      total: room.questions.length,
-      question: room.questions[0].question,
-      options: room.questions[0].options,
-    });
+    io.to(pin).emit("game:started");
+    sendCurrentQuestion(pin, room);
 
-    callback?.({ ok: true });
+    callback({ ok: true });
   });
 
-  socket.on("player:answer", ({ pin, answerIndex } = {}, callback) => {
+  // PLAYER: gửi đáp án
+  socket.on("player:answer", (data = {}, callback = () => {}) => {
+    const pin = String(data.pin || "").trim();
     const room = getRoom(pin);
 
-    if (!room || !room.started || room.revealed) {
-      return callback?.({ ok: false, message: "Hiện không nhận câu trả lời." });
+    if (!room || !room.started) {
+      return callback({
+        ok: false,
+        message: "Phòng chưa bắt đầu hoặc không tồn tại.",
+      });
     }
 
-    const player = room.players.find((item) => item.id === socket.id);
-
-    if (!player) {
-      return callback?.({ ok: false, message: "Bạn không thuộc phòng này." });
+    if (room.answerRevealed) {
+      return callback({
+        ok: false,
+        message: "Câu hỏi đã kết thúc.",
+      });
     }
 
-    if (room.answers.has(socket.id)) {
-      return callback?.({ ok: false, message: "Bạn đã trả lời câu này." });
-    }
+    const player = room.players.get(socket.id);
+    const q = room.questions[room.currentIndex];
+    const answerIndex = data.answerIndex;
 
-    const question = room.questions[room.currentIndex];
+    if (!player || socket.data.playerPin !== pin) {
+      return callback({
+        ok: false,
+        message: "Bạn không ở trong phòng này.",
+      });
+    }
 
     if (
       !Number.isInteger(answerIndex) ||
       answerIndex < 0 ||
-      answerIndex >= question.options.length
+      answerIndex >= q.options.length
     ) {
-      return callback?.({ ok: false, message: "Đáp án không hợp lệ." });
+      return callback({
+        ok: false,
+        message: "Đáp án không hợp lệ.",
+      });
     }
 
-    const correct = answerIndex === question.correctAnswer;
+    if (room.answeredPlayers.has(socket.id)) {
+      return callback({
+        ok: false,
+        message: "Bạn đã trả lời câu này rồi.",
+      });
+    }
 
-    room.answers.set(socket.id, {
-      answerIndex,
-      correct,
-    });
+    room.answeredPlayers.add(socket.id);
+
+    const correct = answerIndex === q.correctAnswer;
 
     if (correct) {
       player.score += 100;
     }
 
-    callback?.({ ok: true, correct });
-    emitPlayers(room.pin, room);
+    callback({ ok: true, correct });
+    emitPlayers(pin, room);
   });
 
-  socket.on("host:reveal-answer", ({ pin } = {}, callback) => {
-    const room = getRoom(pin);
+  // HOST: công bố đáp án
+  socket.on(
+    "host:reveal-answer",
+    (data = {}, callback = () => {}) => {
+      const pin = String(data.pin || "").trim();
+      const room = getRoom(pin);
 
-    if (!room || room.hostId !== socket.id || !room.started) {
-      return callback?.({ ok: false, message: "Không thể công bố đáp án." });
-    }
+      if (!room || room.hostId !== socket.id || !room.started) {
+        return callback({
+          ok: false,
+          message: "Không thể công bố đáp án.",
+        });
+      }
 
-    if (room.revealed) {
-      return callback?.({ ok: false, message: "Đáp án đã được công bố." });
-    }
+      const q = room.questions[room.currentIndex];
+      room.answerRevealed = true;
 
-    room.revealed = true;
-
-    const question = room.questions[room.currentIndex];
-
-    io.to(room.pin).emit("question:result", {
-      correctAnswer: question.correctAnswer,
-      players: publicPlayers(room),
-    });
-
-    callback?.({ ok: true });
-  });
-
-  socket.on("host:next-question", ({ pin } = {}, callback) => {
-    const room = getRoom(pin);
-
-    if (!room || room.hostId !== socket.id || !room.started) {
-      return callback?.({ ok: false, message: "Không thể chuyển câu hỏi." });
-    }
-
-    if (!room.revealed) {
-      return callback?.({
-        ok: false,
-        message: "Hãy công bố đáp án trước.",
-      });
-    }
-
-    const nextIndex = room.currentIndex + 1;
-
-    if (nextIndex >= room.questions.length) {
-      io.to(room.pin).emit("game:finished", {
+      io.to(pin).emit("question:result", {
+        correctAnswer: q.correctAnswer,
         players: publicPlayers(room),
       });
 
-      rooms.delete(room.pin);
-      callback?.({ ok: true, finished: true });
-      return;
+      callback({ ok: true });
     }
+  );
 
-    room.currentIndex = nextIndex;
-    room.revealed = false;
-    room.answers.clear();
+  // HOST: sang câu tiếp theo
+  socket.on(
+    "host:next-question",
+    (data = {}, callback = () => {}) => {
+      const pin = String(data.pin || "").trim();
+      const room = getRoom(pin);
 
-    const question = room.questions[nextIndex];
+      if (!room || room.hostId !== socket.id || !room.started) {
+        return callback({
+          ok: false,
+          message: "Không thể chuyển câu hỏi.",
+        });
+      }
 
-    io.to(room.pin).emit("question:show", {
-      index: nextIndex,
-      total: room.questions.length,
-      question: question.question,
-      options: question.options,
-    });
+      if (!room.answerRevealed) {
+        return callback({
+          ok: false,
+          message: "Hãy công bố đáp án trước.",
+        });
+      }
 
-    callback?.({ ok: true });
-  });
+      if (room.currentIndex + 1 >= room.questions.length) {
+        const finalPlayers = publicPlayers(room).sort(
+          (a, b) => b.score - a.score
+        );
 
+        io.to(pin).emit("game:finished", {
+          players: finalPlayers,
+        });
+
+        callback({ ok: true, finished: true });
+        return;
+      }
+
+      room.currentIndex += 1;
+      sendCurrentQuestion(pin, room);
+
+      callback({ ok: true });
+    }
+  );
+
+  // Ngắt kết nối
   socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
-
     const hostPin = socket.data.hostPin;
-    const hostRoom = getRoom(hostPin);
-
-    if (hostRoom && hostRoom.hostId === socket.id) {
-      io.to(hostPin).emit("room:closed", {
-        message: "Chủ phòng đã ngắt kết nối.",
-      });
-
-      rooms.delete(hostPin);
-    }
-
     const playerPin = socket.data.playerPin;
-    const playerRoom = getRoom(playerPin);
 
-    if (playerRoom) {
-      playerRoom.players = playerRoom.players.filter(
-        (player) => player.id !== socket.id
-      );
+    if (hostPin) {
+      const room = getRoom(hostPin);
 
-      playerRoom.answers.delete(socket.id);
-      emitPlayers(playerPin, playerRoom);
+      if (room && room.hostId === socket.id) {
+        io.to(hostPin).emit("room:closed");
+        rooms.delete(hostPin);
+        console.log(`Room ${hostPin} closed`);
+      }
     }
+
+    if (playerPin) {
+      const room = getRoom(playerPin);
+
+      if (room && room.players.has(socket.id)) {
+        room.players.delete(socket.id);
+        room.answeredPlayers.delete(socket.id);
+        emitPlayers(playerPin, room);
+      }
+    }
+
+    console.log("Socket disconnected:", socket.id);
   });
 });
 
+app.get("/", (_req, res) => {
+  res.json({
+    message: "Quiz Socket Server is running",
+    rooms: rooms.size,
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Quiz Socket Server running on port ${PORT}`);
+  console.log(`Quiz Socket Server listening on port ${PORT}`);
 });
