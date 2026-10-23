@@ -33,7 +33,14 @@ const io = new Server(server, {
 });
 
 // Đăng ký các sự kiện Socket.IO
-registerQuizSocket(io);
+const quizSocket = registerQuizSocket(io);
+
+app.get("/rooms-status", (_req, res) => {
+  res.json({
+    success: true,
+    ...quizSocket.getRoomStatus(),
+  });
+});
 
 app.get("/", (_req, res) => {
   res.json({
