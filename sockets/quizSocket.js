@@ -8,6 +8,7 @@ module.exports = function registerQuizSocket(io) {
   const DEFAULT_TIME_LIMIT = 20;
   const DEFAULT_POINTS = 1000;
   const MAX_QUESTIONS = 10;
+  const NEXT_QUESTION_DELAY = 10_000;
 
   // =========================
   // ROOM HELPERS
@@ -52,6 +53,11 @@ module.exports = function registerQuizSocket(io) {
       clearTimeout(room.timer);
       room.timer = null;
     }
+
+    if (room.nextQuestionTimer) {
+      clearTimeout(room.nextQuestionTimer);
+      room.nextQuestionTimer = null;
+    }
   }
 
   function getRemainingSeconds(room) {
@@ -74,7 +80,6 @@ module.exports = function registerQuizSocket(io) {
       throw new Error("Quiz cần có ít nhất một câu hỏi.");
     }
 
-    // Một trận chỉ chạy tối đa 10 câu.
     return sourceQuestions.slice(0, MAX_QUESTIONS).map((q, index) => {
       const questionText = String(
         q.question_text ?? q.question ?? ""
@@ -186,17 +191,13 @@ module.exports = function registerQuizSocket(io) {
     return {
       correct_answer: question.correct_answer,
       correctAnswer: question.correct_answer,
-
       correctCount,
       wrongCount,
       unansweredCount,
       totalAnswered,
       totalPlayers,
-
-      // Giữ mảng số nguyên để frontend có thể dùng trực tiếp.
       answerCounts,
 
-      // Dạng object để frontend hiển thị nhãn và số lượt chọn.
       answerDistribution: answerCounts.map((count, index) => ({
         answerIndex: index,
         label: ["A", "B", "C", "D"][index],
@@ -210,89 +211,14 @@ module.exports = function registerQuizSocket(io) {
   }
 
   // =========================
-  // REVEAL QUESTION RESULT
-  // =========================
-
-  function revealQuestion(pin, room, reason = "host") {
-    if (!room || room.answerRevealed || !room.currentQuestion) {
-      return false;
-    }
-
-    clearQuestionTimer(room);
-
-    room.answerRevealed = true;
-    room.questionEndsAt = null;
-
-    const stats = buildQuestionStats(room);
-
-    io.to(pin).emit("question:result", {
-      ...stats,
-      reason,
-      index: room.currentIndex + 1,
-      total: room.questions.length,
-    });
-
-    // Giữ event answer:count tương thích với frontend hiện tại.
-    io.to(pin).emit("answer:count", {
-      count: stats.totalAnswered,
-      totalPlayers: stats.totalPlayers,
-    });
-
-    console.log("QUESTION RESULT:", {
-      pin,
-      question: room.currentIndex + 1,
-      reason,
-      correct: stats.correctCount,
-      wrong: stats.wrongCount,
-      unanswered: stats.unansweredCount,
-    });
-
-    return true;
-  }
-
-  // =========================
-  // QUESTION TIMER
-  // =========================
-
-  function startQuestionTimer(pin, room) {
-    clearQuestionTimer(room);
-
-    const timeLimit = room.currentQuestion.time_limit;
-
-    room.questionEndsAt = Date.now() + timeLimit * 1000;
-
-    // Gửi thời gian bắt đầu để frontend đồng bộ bộ đếm.
-    io.to(pin).emit("question:timer", {
-      pin,
-      index: room.currentIndex + 1,
-      timeLimit,
-      endsAt: room.questionEndsAt,
-      remainingSeconds: timeLimit,
-    });
-
-    room.timer = setTimeout(() => {
-      // Kiểm tra lại phòng và câu hỏi nhằm tránh timer cũ
-      // kết thúc nhầm câu mới.
-      const currentRoom = getRoom(pin);
-
-      if (
-        currentRoom !== room ||
-        !room.started ||
-        room.answerRevealed ||
-        !room.currentQuestion
-      ) {
-        return;
-      }
-
-      revealQuestion(pin, room, "timeout");
-    }, timeLimit * 1000);
-  }
-
-  // =========================
   // SEND NEXT QUESTION
   // =========================
 
   function sendNextQuestion(pin, room) {
+    if (!room || getRoom(pin) !== room) {
+      return { finished: false };
+    }
+
     clearQuestionTimer(room);
 
     const nextIndex = room.currentIndex + 1;
@@ -300,6 +226,7 @@ module.exports = function registerQuizSocket(io) {
     if (nextIndex >= room.questions.length) {
       room.started = false;
       room.finished = true;
+      room.answerRevealed = true;
       room.currentQuestion = null;
       room.questionEndsAt = null;
 
@@ -313,14 +240,14 @@ module.exports = function registerQuizSocket(io) {
 
       console.log("GAME FINISHED:", pin);
 
-      // Giữ phòng sau trận để host/người chơi nhận được event.
-      // Phòng sẽ được xóa khi host đóng phòng hoặc host mất kết nối.
       return { finished: true };
     }
 
     room.currentIndex = nextIndex;
     room.currentQuestion = room.questions[nextIndex];
     room.answerRevealed = false;
+    room.questionEndsAt = null;
+
     room.answeredPlayers.clear();
     room.answers.clear();
 
@@ -345,6 +272,129 @@ module.exports = function registerQuizSocket(io) {
     );
 
     return { finished: false };
+  }
+
+  // =========================
+  // AUTO NEXT QUESTION
+  // =========================
+
+  function scheduleNextQuestion(pin, room) {
+    if (
+      !room ||
+      room.finished ||
+      !room.started ||
+      !room.answerRevealed
+    ) {
+      return;
+    }
+
+    if (room.nextQuestionTimer) {
+      clearTimeout(room.nextQuestionTimer);
+      room.nextQuestionTimer = null;
+    }
+
+    const questionIndex = room.currentIndex;
+
+    room.nextQuestionTimer = setTimeout(() => {
+      const currentRoom = getRoom(pin);
+
+      if (
+        currentRoom !== room ||
+        !room.started ||
+        room.finished ||
+        !room.answerRevealed ||
+        room.currentIndex !== questionIndex
+      ) {
+        return;
+      }
+
+      room.nextQuestionTimer = null;
+
+      sendNextQuestion(pin, room);
+    }, NEXT_QUESTION_DELAY);
+
+    console.log(
+      `AUTO NEXT SCHEDULED: ${pin} - ${NEXT_QUESTION_DELAY / 1000}s`
+    );
+  }
+
+  // =========================
+  // REVEAL QUESTION RESULT
+  // =========================
+
+  function revealQuestion(pin, room, reason = "host") {
+    if (!room || room.answerRevealed || !room.currentQuestion) {
+      return false;
+    }
+
+    clearQuestionTimer(room);
+
+    room.answerRevealed = true;
+    room.questionEndsAt = null;
+
+    const stats = buildQuestionStats(room);
+
+    io.to(pin).emit("question:result", {
+      ...stats,
+      reason,
+      index: room.currentIndex + 1,
+      total: room.questions.length,
+      nextQuestionIn: NEXT_QUESTION_DELAY / 1000,
+    });
+
+    io.to(pin).emit("answer:count", {
+      count: stats.totalAnswered,
+      totalPlayers: stats.totalPlayers,
+    });
+
+    console.log("QUESTION RESULT:", {
+      pin,
+      question: room.currentIndex + 1,
+      reason,
+      correct: stats.correctCount,
+      wrong: stats.wrongCount,
+      unanswered: stats.unansweredCount,
+    });
+
+    // Hiện kết quả xong, tự chuyển câu sau 10 giây.
+    scheduleNextQuestion(pin, room);
+
+    return true;
+  }
+
+  // =========================
+  // QUESTION TIMER
+  // =========================
+
+  function startQuestionTimer(pin, room) {
+    clearQuestionTimer(room);
+
+    const timeLimit = room.currentQuestion.time_limit;
+
+    room.questionEndsAt = Date.now() + timeLimit * 1000;
+
+    io.to(pin).emit("question:timer", {
+      pin,
+      index: room.currentIndex + 1,
+      timeLimit,
+      endsAt: room.questionEndsAt,
+      remainingSeconds: timeLimit,
+    });
+
+    room.timer = setTimeout(() => {
+      const currentRoom = getRoom(pin);
+
+      if (
+        currentRoom !== room ||
+        !room.started ||
+        room.answerRevealed ||
+        !room.currentQuestion
+      ) {
+        return;
+      }
+
+      revealQuestion(pin, room, "timeout");
+    }, timeLimit * 1000);
   }
 
   // =========================
@@ -384,8 +434,7 @@ module.exports = function registerQuizSocket(io) {
           if (!quiz) {
             return ack({
               ok: false,
-              message:
-                "Không tìm thấy Quiz hoặc bạn không có quyền truy cập.",
+              message: "Không tìm thấy bài quiz.",
             });
           }
 
@@ -416,6 +465,7 @@ module.exports = function registerQuizSocket(io) {
           answers: new Map(),
 
           timer: null,
+          nextQuestionTimer: null,
           questionEndsAt: null,
         };
 
@@ -429,7 +479,6 @@ module.exports = function registerQuizSocket(io) {
           quizId,
           title,
           questionCount: questions.length,
-          activeRooms: [...rooms.keys()],
         });
 
         return ack({
@@ -609,8 +658,6 @@ module.exports = function registerQuizSocket(io) {
         });
       }
 
-      // Phòng trường hợp event đến ngay sau thời điểm hết giờ
-      // nhưng callback timer chưa kịp chạy.
       if (
         !room.questionEndsAt ||
         Date.now() >= room.questionEndsAt
@@ -645,7 +692,6 @@ module.exports = function registerQuizSocket(io) {
 
       const correct = answerIndex === q.correct_answer;
 
-      // Lưu câu trả lời để thống kê sau này.
       room.answers.set(socket.id, {
         playerId: socket.id,
         answerIndex,
@@ -653,7 +699,6 @@ module.exports = function registerQuizSocket(io) {
         answeredAt: Date.now(),
       });
 
-      // Giữ cách tính điểm hiện tại để tương thích.
       if (correct) {
         player.score += q.points;
       }
@@ -679,7 +724,7 @@ module.exports = function registerQuizSocket(io) {
         totalPlayers: room.players.size,
       });
 
-      // Nếu tất cả người chơi đã trả lời, tự động hiện kết quả.
+      // Khi tất cả người chơi đã trả lời, hiện kết quả.
       if (room.answeredPlayers.size >= room.players.size) {
         revealQuestion(pin, room, "all-answered");
       }
@@ -747,6 +792,7 @@ module.exports = function registerQuizSocket(io) {
         });
       }
 
+      // Nếu host bấm sớm, hủy timer và chuyển câu ngay.
       const result = sendNextQuestion(room.pin, room);
 
       return ack({ ok: true, ...result });
@@ -776,7 +822,6 @@ module.exports = function registerQuizSocket(io) {
       });
 
       rooms.delete(room.pin);
-
       socket.data.hostPin = null;
 
       return ack({ ok: true });
@@ -819,8 +864,6 @@ module.exports = function registerQuizSocket(io) {
 
           emitPlayers(playerPin, playerRoom);
 
-          // Nếu người chơi rời phòng khiến tất cả người còn lại
-          // đã trả lời, kết thúc câu hỏi.
           if (
             playerRoom.started &&
             !playerRoom.answerRevealed &&
