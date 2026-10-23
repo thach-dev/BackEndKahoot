@@ -773,30 +773,33 @@ module.exports = function registerQuizSocket(io) {
     // =========================
 
     socket.on("host:next-question", (data = {}, callback) => {
-      const ack =
-        typeof callback === "function" ? callback : () => {};
+  const ack =
+    typeof callback === "function" ? callback : () => {};
 
-      const room = getRoom(data.pin);
+  const room = getRoom(data.pin);
 
-      if (!isHost(socket, room) || !room.started) {
-        return ack({
-          ok: false,
-          message: "Không thể chuyển câu hỏi.",
-        });
-      }
-
-      if (!room.answerRevealed) {
-        return ack({
-          ok: false,
-          message: "Hãy chờ hết giờ hoặc công bố đáp án trước.",
-        });
-      }
-
-      // Nếu host bấm sớm, hủy timer và chuyển câu ngay.
-      const result = sendNextQuestion(room.pin, room);
-
-      return ack({ ok: true, ...result });
+  if (!isHost(socket, room) || !room.started) {
+    return ack({
+      ok: false,
+      message: "Không thể chuyển câu hỏi.",
     });
+  }
+
+  if (!room.answerRevealed) {
+    return ack({
+      ok: false,
+      message: "Hãy chờ hết giờ hoặc công bố đáp án trước.",
+    });
+  }
+
+  // sendNextQuestion sẽ hủy timer tự động của câu hiện tại.
+  const result = sendNextQuestion(room.pin, room);
+
+  return ack({
+    ok: true,
+    ...result,
+  });
+});
 
     // =========================
     // HOST: CLOSE ROOM
