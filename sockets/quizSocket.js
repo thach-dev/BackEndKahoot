@@ -550,10 +550,13 @@ module.exports = function registerQuizSocket(io) {
 
   // Route kiểm tra trạng thái phòng.
   // Route được gắn vào Express từ index.js thông qua hàm này.
-  app.get("/rooms-status", (_req, res) => {
-    res.json({
-      count: rooms.size,
-      pins: [...rooms.keys()],
-    });
-  });
+    // Trả trạng thái phòng cho index.js sử dụng.
+  return {
+    getRoomStatus() {
+      return {
+        count: rooms.size,
+        pins: [...rooms.keys()],
+      };
+    },
+  };
 };
