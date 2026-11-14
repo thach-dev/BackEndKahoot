@@ -15,9 +15,13 @@ const server = http.createServer(app);
 
 const PORT = process.env.PORT || 3000;
 
+// ========================================
+// CORS CONFIGURATION
+// ========================================
+
 const allowedOrigins = (process.env.FRONTEND_URL || "*")
     .split(",")
-    .map((origin) => origin.trim())
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
     .filter(Boolean);
 
 const corsOrigin = allowedOrigins.includes("*")
@@ -28,12 +32,13 @@ app.use(cors({
     origin: corsOrigin,
     methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
 }));
 
 app.use(express.json());
 
 // ========================================
-// SOCKET.IO
+// SOCKET.IO CONFIGURATION
 // ========================================
 
 const io = new Server(server, {
@@ -42,24 +47,43 @@ const io = new Server(server, {
         methods: ["GET", "POST"],
         credentials: true,
     },
+
+    transports: ["websocket", "polling"],
+
+    pingInterval: 25000,
+    pingTimeout: 20000,
+
+    connectTimeout: 20000,
 });
 
 // ========================================
-// JWT AUTH
+// SOCKET JWT AUTHENTICATION
 // ========================================
 
 io.use((socket, next) => {
     try {
+        console.log("\n========== SOCKET AUTH ==========");
+        console.log("Socket ID:", socket.id);
+        console.log("Origin:", socket.handshake.headers.origin);
+
         const token = socket.handshake.auth?.token;
 
+        console.log("Có token:", Boolean(token));
+        console.log("Có JWT_SECRET:", Boolean(process.env.JWT_SECRET));
+
+        // Kiểm tra token
         if (!token) {
-            return next(new Error("Vui lòng đăng nhập."));
+            console.log("AUTH ERROR: TOKEN_MISSING");
+            return next(new Error("TOKEN_MISSING"));
         }
 
+        // Kiểm tra JWT_SECRET
         if (!process.env.JWT_SECRET) {
-            return next(new Error("Thiếu JWT_SECRET."));
+            console.log("AUTH ERROR: JWT_SECRET_MISSING");
+            return next(new Error("JWT_SECRET_MISSING"));
         }
 
+        // Xác thực JWT
         const decoded = jwt.verify(
             token,
             process.env.JWT_SECRET
@@ -72,30 +96,79 @@ io.use((socket, next) => {
             decoded.sub;
 
         if (!userId) {
-            return next(new Error("Token không có user ID."));
+            console.log("AUTH ERROR: USER_ID_MISSING");
+            return next(new Error("USER_ID_MISSING"));
         }
 
+        // Lưu thông tin người dùng
         socket.data.userId = String(userId);
+        socket.data.user = decoded;
 
-        next();
+        console.log("AUTH SUCCESS");
+        console.log("User ID:", socket.data.userId);
+        console.log("=================================\n");
+
+        return next();
+
     } catch (error) {
-        console.error("Socket authentication:", error.message);
-        next(new Error("Token không hợp lệ hoặc hết hạn."));
+        console.error("SOCKET AUTH FAILED:");
+        console.error("Error name:", error.name);
+        console.error("Error message:", error.message);
+        console.log("=================================\n");
+
+        if (error.name === "TokenExpiredError") {
+            return next(new Error("TOKEN_EXPIRED"));
+        }
+
+        if (error.name === "JsonWebTokenError") {
+            return next(new Error("TOKEN_INVALID"));
+        }
+
+        return next(new Error("AUTH_FAILED"));
     }
 });
 
 // ========================================
-// REGISTER SOCKET
+// REGISTER QUIZ SOCKET
 // ========================================
 
 const quizSocket = registerQuizSocket(io);
-const wordChainSocket = registerWordChainSocket(io);
 
 console.log("Quiz Socket: READY");
+
+// ========================================
+// REGISTER WORD CHAIN SOCKET
+// ========================================
+
+const wordChainSocket = registerWordChainSocket(io);
+
 console.log("Word Chain Socket: READY");
 
 // ========================================
-// HTTP
+// SOCKET CONNECTION EVENTS
+// ========================================
+
+io.on("connection", (socket) => {
+    console.log("SOCKET CONNECTED:", {
+        socketId: socket.id,
+        userId: socket.data.userId,
+    });
+
+    socket.on("disconnect", (reason) => {
+        console.log("SOCKET DISCONNECTED:", {
+            socketId: socket.id,
+            userId: socket.data.userId,
+            reason,
+        });
+    });
+
+    socket.on("error", (error) => {
+        console.error("SOCKET ERROR:", error);
+    });
+});
+
+// ========================================
+// HTTP ROUTES
 // ========================================
 
 app.get("/", (req, res) => {
@@ -113,25 +186,56 @@ app.get("/health", (req, res) => {
     res.json({
         success: true,
         service: "game-socket-server",
+        status: "healthy",
         timestamp: new Date().toISOString(),
     });
 });
 
+// ========================================
+// QUIZ ROOM STATUS
+// ========================================
+
 app.get("/rooms-status", (req, res) => {
-    res.json({
-        success: true,
-        game: "quiz",
-        ...quizSocket.getRoomStatus(),
-    });
+    try {
+        res.json({
+            success: true,
+            game: "quiz",
+            ...quizSocket.getRoomStatus(),
+        });
+    } catch (error) {
+        console.error("QUIZ ROOM STATUS ERROR:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Không thể lấy trạng thái phòng Quiz.",
+        });
+    }
 });
 
+// ========================================
+// WORD CHAIN ROOM STATUS
+// ========================================
+
 app.get("/word-chain-rooms-status", (req, res) => {
-    res.json({
-        success: true,
-        game: "word-chain",
-        ...wordChainSocket.getRoomStatus(),
-    });
+    try {
+        res.json({
+            success: true,
+            game: "word-chain",
+            ...wordChainSocket.getRoomStatus(),
+        });
+    } catch (error) {
+        console.error("WORD CHAIN ROOM STATUS ERROR:", error);
+
+        res.status(500).json({
+            success: false,
+            message: "Không thể lấy trạng thái phòng Nối Từ.",
+        });
+    }
 });
+
+// ========================================
+// 404
+// ========================================
 
 app.use((req, res) => {
     res.status(404).json({
@@ -141,10 +245,44 @@ app.use((req, res) => {
     });
 });
 
+// ========================================
+// GLOBAL ERROR HANDLER
+// ========================================
+
+app.use((error, req, res, next) => {
+    console.error("SERVER ERROR:", error);
+
+    res.status(500).json({
+        success: false,
+        message: "Lỗi máy chủ.",
+    });
+});
+
+// ========================================
+// START SERVER
+// ========================================
+
 server.listen(PORT, "0.0.0.0", () => {
     console.log("--------------------------------");
     console.log(`Server running on port ${PORT}`);
     console.log("Quiz Multiplayer: READY");
     console.log("Word Chain Multiplayer: READY");
+    console.log("Socket.IO: READY");
     console.log("--------------------------------");
+});
+
+// ========================================
+// HANDLE SERVER ERRORS
+// ========================================
+
+server.on("error", (error) => {
+    console.error("HTTP SERVER ERROR:", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+    console.error("UNHANDLED REJECTION:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+    console.error("UNCAUGHT EXCEPTION:", error);
 });
