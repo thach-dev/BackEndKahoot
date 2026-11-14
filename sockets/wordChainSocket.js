@@ -1,9 +1,30 @@
 
+const crypto = require("crypto");
+
 const rooms = new Map();
 
 const MAX_PLAYERS = 20;
 const POINTS_PER_CORRECT = 10;
 const GAME_TIME = 180;
+
+// Tên sự kiện riêng của game Nối Từ
+const EVENTS = {
+    HOST_CREATE: "wordchain:host:create",
+    PLAYER_JOIN: "wordchain:player:join",
+    HOST_START: "wordchain:host:start",
+    PLAYER_MATCH: "wordchain:player:match",
+    PLAYER_FINISH: "wordchain:player:finish",
+    PLAYER_LEAVE: "wordchain:player:leave",
+    HOST_CLOSE: "wordchain:host:close",
+
+    ROOM_PLAYERS: "wordchain:room:players",
+    GAME_STARTED: "wordchain:game:started",
+    GAME_FINISHED: "wordchain:game:finished",
+    GAME_ERROR: "wordchain:game:error",
+    MATCH_RESULT: "wordchain:match:result",
+    ROOM_CLOSED: "wordchain:room:closed",
+    PLAYER_LEFT: "wordchain:player:left",
+};
 
 const normalize = (value) => {
     return String(value || "")
@@ -18,11 +39,18 @@ const createPin = () => {
 
     do {
         pin = String(
-            Math.floor(100000 + Math.random() * 900000)
+            crypto.randomInt(100000, 1000000)
         );
     } while (rooms.has(pin));
 
     return pin;
+};
+
+// Tách phòng Nối Từ khỏi phòng Quiz
+const getSocketRoom = (pin) => `wordchain:${pin}`;
+
+const getPlayerId = (socket) => {
+    return String(socket.data.userId || socket.id);
 };
 
 const shuffle = (array) => {
@@ -40,32 +68,31 @@ const shuffle = (array) => {
     return result;
 };
 
-const getPlayerId = (socket) => {
-    return socket.data.userId || socket.id;
-};
-
 const getPublicPlayers = (room) => {
-    return [...room.players.values()].map((player) => ({
-        id: player.id,
-        nickname: player.nickname,
-        isHost: player.id === room.hostId,
-        score: player.score,
-        correctCount: player.correctCount,
-        answeredCount: player.answeredQuestionIds.size,
-        totalQuestions: room.questions.length,
-        finished: player.finished,
-    }));
+    return [...room.players.values()]
+        .map((player) => ({
+            id: player.id,
+            nickname: player.nickname,
+            isHost: player.id === room.hostId,
+            score: player.score,
+            correctCount: player.correctCount,
+            wrongCount: player.wrongCount,
+            answeredCount: player.answeredQuestionIds.size,
+            totalQuestions: room.questions.length,
+            finished: player.finished,
+        }))
+        .sort((a, b) => b.score - a.score);
 };
 
 const emitPlayers = (io, room) => {
-    io.to(room.pin).emit(
-        "room:players",
+    io.to(getSocketRoom(room.pin)).emit(
+        EVENTS.ROOM_PLAYERS,
         getPublicPlayers(room)
     );
 };
 
 const clearGameTimer = (room) => {
-    if (room.gameTimer) {
+    if (room?.gameTimer) {
         clearTimeout(room.gameTimer);
         room.gameTimer = null;
     }
@@ -92,18 +119,21 @@ const getLeaderboard = (room) => {
 };
 
 const finishGame = (io, room, reason = "completed") => {
-    if (!room.started) return;
+    if (!room || !room.started) return;
 
     clearGameTimer(room);
 
     room.started = false;
     room.finished = true;
 
-    io.to(room.pin).emit("game:finished", {
-        reason,
-        leaderboard: getLeaderboard(room),
-        players: getPublicPlayers(room),
-    });
+    io.to(getSocketRoom(room.pin)).emit(
+        EVENTS.GAME_FINISHED,
+        {
+            reason,
+            leaderboard: getLeaderboard(room),
+            players: getPublicPlayers(room),
+        }
+    );
 };
 
 const checkAllPlayersFinished = (io, room) => {
@@ -127,7 +157,7 @@ const getPlayerGameData = (room) => {
         pin: room.pin,
         wordSetTitle: room.wordSetTitle,
 
-        // Không gửi correct_option_key xuống client.
+        // Không gửi đáp án đúng xuống client.
         questions: room.questions.map((question) => ({
             id: question.id,
             left_text: question.left_text,
@@ -143,15 +173,87 @@ const getPlayerGameData = (room) => {
     };
 };
 
+function leaveRoom(io, socket, userId) {
+    const pin = socket.data.wordChainRoom;
+
+    if (!pin) return;
+
+    const room = rooms.get(pin);
+
+    if (!room) {
+        socket.leave(getSocketRoom(pin));
+        delete socket.data.wordChainRoom;
+        return;
+    }
+
+    // Chủ phòng rời phòng
+    if (room.hostId === userId) {
+        clearGameTimer(room);
+
+        io.to(getSocketRoom(pin)).emit(
+            EVENTS.ROOM_CLOSED,
+            {
+                message: "Chủ phòng đã rời phòng.",
+            }
+        );
+
+        rooms.delete(pin);
+
+        socket.leave(getSocketRoom(pin));
+        delete socket.data.wordChainRoom;
+
+        return;
+    }
+
+    const player = room.players.get(userId);
+
+    if (player) {
+        room.players.delete(userId);
+
+        io.to(getSocketRoom(pin)).emit(
+            EVENTS.PLAYER_LEFT,
+            {
+                playerId: userId,
+                nickname: player.nickname,
+            }
+        );
+
+        emitPlayers(io, room);
+
+        if (room.started) {
+            if (room.players.size === 0) {
+                clearGameTimer(room);
+                rooms.delete(pin);
+            } else {
+                checkAllPlayersFinished(io, room);
+            }
+        }
+    }
+
+    socket.leave(getSocketRoom(pin));
+    delete socket.data.wordChainRoom;
+}
+
 const registerWordChainSocket = (io) => {
     io.on("connection", (socket) => {
         const userId = getPlayerId(socket);
+
+        console.log(
+            "WORD CHAIN SOCKET CONNECTED:",
+            socket.id,
+            userId
+        );
 
         // ====================================
         // HOST CREATE ROOM
         // ====================================
 
-        socket.on("host:create", (payload = {}, callback) => {
+        socket.on(EVENTS.HOST_CREATE, (payload = {}, callback) => {
+            const ack =
+                typeof callback === "function"
+                    ? callback
+                    : () => {};
+
             try {
                 const {
                     wordSetId,
@@ -162,7 +264,6 @@ const registerWordChainSocket = (io) => {
                     hostNickname,
                 } = payload;
 
-                // Hỗ trợ cả gameData và dữ liệu truyền trực tiếp.
                 const sourceQuestions =
                     gameData?.questions || questions;
 
@@ -174,7 +275,7 @@ const registerWordChainSocket = (io) => {
                     !Array.isArray(sourceQuestions) ||
                     !Array.isArray(sourceOptions)
                 ) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Dữ liệu bộ ghép đôi không hợp lệ.",
                     });
@@ -184,7 +285,7 @@ const registerWordChainSocket = (io) => {
                     sourceQuestions.length < 1 ||
                     sourceQuestions.length > 1000
                 ) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Bộ câu hỏi phải có từ 1 đến 1000 câu.",
                     });
@@ -194,7 +295,7 @@ const registerWordChainSocket = (io) => {
                     sourceOptions.length < 1 ||
                     sourceOptions.length > 1000
                 ) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Bộ đáp án không hợp lệ.",
                     });
@@ -205,18 +306,19 @@ const registerWordChainSocket = (io) => {
 
                 for (const item of sourceQuestions) {
                     const id = String(item.id || "").trim();
+
                     const leftText = String(
                         item.left_text || ""
                     ).trim();
 
                     const correctKey = String(
-                        item.correct_option_key || "0"
+                        item.correct_option_key ?? "0"
                     ).trim();
 
                     if (!id || !leftText) continue;
 
                     if (questionIds.has(id)) {
-                        return callback?.({
+                        return ack({
                             success: false,
                             message: `Câu hỏi bị trùng ID: ${id}`,
                         });
@@ -246,7 +348,7 @@ const registerWordChainSocket = (io) => {
                     if (!key || !rightText) continue;
 
                     if (optionKeys.has(key)) {
-                        return callback?.({
+                        return ack({
                             success: false,
                             message: `Mã đáp án bị trùng: ${key}`,
                         });
@@ -264,19 +366,18 @@ const registerWordChainSocket = (io) => {
                     !normalizedQuestions.length ||
                     !normalizedOptions.length
                 ) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Không có đủ câu hỏi hoặc đáp án.",
                     });
                 }
 
-                // Kiểm tra đáp án có tồn tại trong cột phải.
                 for (const question of normalizedQuestions) {
                     if (
                         question.correct_option_key !== "0" &&
                         !optionKeys.has(question.correct_option_key)
                     ) {
-                        return callback?.({
+                        return ack({
                             success: false,
                             message:
                                 `Câu ${question.id} có mã đáp án không tồn tại.`,
@@ -290,8 +391,7 @@ const registerWordChainSocket = (io) => {
                     pin,
                     hostId: userId,
                     wordSetId,
-                    wordSetTitle:
-                        wordSetTitle || "Bộ ghép đôi",
+                    wordSetTitle: wordSetTitle || "Bộ ghép đôi",
 
                     questions: normalizedQuestions,
                     options: normalizedOptions,
@@ -303,11 +403,11 @@ const registerWordChainSocket = (io) => {
                     gameTimer: null,
                 };
 
-                // Chủ phòng cũng tham gia chơi.
                 room.players.set(userId, {
                     id: userId,
-                    nickname:
-                        String(hostNickname || "Chủ phòng").trim(),
+                    nickname: String(
+                        hostNickname || "Chủ phòng"
+                    ).trim(),
                     score: 0,
                     correctCount: 0,
                     wrongCount: 0,
@@ -317,23 +417,25 @@ const registerWordChainSocket = (io) => {
 
                 rooms.set(pin, room);
 
-                socket.join(pin);
+                socket.join(getSocketRoom(pin));
                 socket.data.wordChainRoom = pin;
 
                 emitPlayers(io, room);
 
-                callback?.({
+                console.log("WORD CHAIN ROOM CREATED:", pin);
+
+                return ack({
                     success: true,
                     pin,
                     wordSetTitle: room.wordSetTitle,
                     players: getPublicPlayers(room),
                 });
             } catch (error) {
-                console.error("host:create:", error);
+                console.error("WORD CHAIN HOST CREATE ERROR:", error);
 
-                callback?.({
+                return ack({
                     success: false,
-                    message: "Không thể tạo phòng.",
+                    message: error.message || "Không thể tạo phòng.",
                 });
             }
         });
@@ -342,12 +444,14 @@ const registerWordChainSocket = (io) => {
         // PLAYER JOIN
         // ====================================
 
-        socket.on("player:join", (payload = {}, callback) => {
-            try {
-                const pin = String(
-                    payload.pin || ""
-                ).trim();
+        socket.on(EVENTS.PLAYER_JOIN, (payload = {}, callback) => {
+            const ack =
+                typeof callback === "function"
+                    ? callback
+                    : () => {};
 
+            try {
+                const pin = String(payload.pin || "").trim();
                 const nickname = String(
                     payload.nickname || ""
                 ).trim();
@@ -355,38 +459,44 @@ const registerWordChainSocket = (io) => {
                 const room = rooms.get(pin);
 
                 if (!room) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Phòng không tồn tại.",
                     });
                 }
 
                 if (room.started || room.finished) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Trận đấu đã bắt đầu hoặc kết thúc.",
                     });
                 }
 
                 if (!nickname || nickname.length > 24) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Tên người chơi phải từ 1 đến 24 ký tự.",
                     });
                 }
 
                 if (room.players.has(userId)) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Bạn đã ở trong phòng.",
                     });
                 }
 
                 if (room.players.size >= MAX_PLAYERS) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Phòng đã đủ người.",
                     });
+                }
+
+                const oldPin = socket.data.wordChainRoom;
+
+                if (oldPin && oldPin !== pin) {
+                    leaveRoom(io, socket, userId);
                 }
 
                 room.players.set(userId, {
@@ -399,20 +509,20 @@ const registerWordChainSocket = (io) => {
                     finished: false,
                 });
 
-                socket.join(pin);
+                socket.join(getSocketRoom(pin));
                 socket.data.wordChainRoom = pin;
 
                 emitPlayers(io, room);
 
-                callback?.({
+                return ack({
                     success: true,
                     pin,
                     players: getPublicPlayers(room),
                 });
             } catch (error) {
-                console.error("player:join:", error);
+                console.error("WORD CHAIN PLAYER JOIN ERROR:", error);
 
-                callback?.({
+                return ack({
                     success: false,
                     message: "Không thể tham gia phòng.",
                 });
@@ -423,18 +533,37 @@ const registerWordChainSocket = (io) => {
         // HOST START GAME
         // ====================================
 
-        socket.on("host:start", () => {
-            const pin = socket.data.wordChainRoom;
+        socket.on(EVENTS.HOST_START, (payload = {}, callback) => {
+            const ack =
+                typeof callback === "function"
+                    ? callback
+                    : () => {};
+
+            const pin = String(
+                payload.pin || socket.data.wordChainRoom || ""
+            ).trim();
+
             const room = rooms.get(pin);
 
-            if (!room || room.hostId !== userId) return;
-            if (room.started || room.finished) return;
+            if (!room || room.hostId !== userId) {
+                return ack({
+                    success: false,
+                    message: "Bạn không phải chủ phòng.",
+                });
+            }
+
+            if (room.started || room.finished) {
+                return ack({
+                    success: false,
+                    message: "Trận đấu đã bắt đầu hoặc kết thúc.",
+                });
+            }
 
             if (room.players.size < 2) {
-                socket.emit("game:error", {
+                return ack({
+                    success: false,
                     message: "Cần ít nhất 2 người chơi.",
                 });
-                return;
             }
 
             room.started = true;
@@ -450,8 +579,8 @@ const registerWordChainSocket = (io) => {
                 player.finished = false;
             }
 
-            io.to(pin).emit(
-                "game:started",
+            io.to(getSocketRoom(pin)).emit(
+                EVENTS.GAME_STARTED,
                 getPlayerGameData(room)
             );
 
@@ -460,19 +589,26 @@ const registerWordChainSocket = (io) => {
             }, GAME_TIME * 1000);
 
             emitPlayers(io, room);
+
+            return ack({ success: true });
         });
 
         // ====================================
         // PLAYER MATCH
         // ====================================
 
-        socket.on("player:match", (payload = {}, callback) => {
+        socket.on(EVENTS.PLAYER_MATCH, (payload = {}, callback) => {
+            const ack =
+                typeof callback === "function"
+                    ? callback
+                    : () => {};
+
             try {
                 const pin = socket.data.wordChainRoom;
                 const room = rooms.get(pin);
 
                 if (!room || !room.started) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Trận đấu chưa bắt đầu.",
                     });
@@ -481,14 +617,14 @@ const registerWordChainSocket = (io) => {
                 const player = room.players.get(userId);
 
                 if (!player) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Bạn không có trong phòng.",
                     });
                 }
 
                 if (player.finished) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Bạn đã hoàn thành lượt chơi.",
                     });
@@ -511,16 +647,14 @@ const registerWordChainSocket = (io) => {
                 );
 
                 if (!question || !option) {
-                    return callback?.({
+                    return ack({
                         success: false,
                         message: "Cặp ghép không hợp lệ.",
                     });
                 }
 
-                if (
-                    player.answeredQuestionIds.has(questionId)
-                ) {
-                    return callback?.({
+                if (player.answeredQuestionIds.has(questionId)) {
+                    return ack({
                         success: false,
                         message: "Câu hỏi này đã được trả lời.",
                     });
@@ -555,25 +689,22 @@ const registerWordChainSocket = (io) => {
                     score: player.score,
                     correctCount: player.correctCount,
                     wrongCount: player.wrongCount,
-                    answeredCount:
-                        player.answeredQuestionIds.size,
+                    answeredCount: player.answeredQuestionIds.size,
                     totalQuestions: room.questions.length,
                     finished: player.finished,
                 };
 
-                // Chỉ gửi kết quả chi tiết cho người trả lời.
-                socket.emit("match:result", result);
+                socket.emit(EVENTS.MATCH_RESULT, result);
 
-                // Cập nhật bảng người chơi cho toàn phòng.
                 emitPlayers(io, room);
 
-                callback?.(result);
+                ack(result);
 
                 checkAllPlayersFinished(io, room);
             } catch (error) {
-                console.error("player:match:", error);
+                console.error("WORD CHAIN PLAYER MATCH ERROR:", error);
 
-                callback?.({
+                ack({
                     success: false,
                     message: "Không thể kiểm tra cặp ghép.",
                 });
@@ -584,7 +715,7 @@ const registerWordChainSocket = (io) => {
         // PLAYER FINISH
         // ====================================
 
-        socket.on("player:finish", () => {
+        socket.on(EVENTS.PLAYER_FINISH, () => {
             const pin = socket.data.wordChainRoom;
             const room = rooms.get(pin);
 
@@ -597,7 +728,6 @@ const registerWordChainSocket = (io) => {
             player.finished = true;
 
             emitPlayers(io, room);
-
             checkAllPlayersFinished(io, room);
         });
 
@@ -605,7 +735,7 @@ const registerWordChainSocket = (io) => {
         // PLAYER LEAVE
         // ====================================
 
-        socket.on("player:leave", () => {
+        socket.on(EVENTS.PLAYER_LEAVE, () => {
             leaveRoom(io, socket, userId);
         });
 
@@ -613,25 +743,40 @@ const registerWordChainSocket = (io) => {
         // HOST CLOSE ROOM
         // ====================================
 
-        socket.on("host:close", () => {
-            const pin = socket.data.wordChainRoom;
+        socket.on(EVENTS.HOST_CLOSE, (payload = {}, callback) => {
+            const ack =
+                typeof callback === "function"
+                    ? callback
+                    : () => {};
+
+            const pin = String(
+                payload.pin || socket.data.wordChainRoom || ""
+            ).trim();
+
             const room = rooms.get(pin);
 
-            if (!room || room.hostId !== userId) return;
+            if (!room || room.hostId !== userId) {
+                return ack({
+                    success: false,
+                    message: "Bạn không phải chủ phòng.",
+                });
+            }
 
             clearGameTimer(room);
 
-            io.to(pin).emit("room:closed", {
-                message: "Chủ phòng đã đóng phòng.",
-            });
+            io.to(getSocketRoom(pin)).emit(
+                EVENTS.ROOM_CLOSED,
+                {
+                    message: "Chủ phòng đã đóng phòng.",
+                }
+            );
 
             rooms.delete(pin);
 
-            for (const member of room.players.keys()) {
-                // Socket của các người chơi khác sẽ được
-                // xử lý khi họ rời hoặc ngắt kết nối.
-                if (member === userId) continue;
-            }
+            socket.leave(getSocketRoom(pin));
+            delete socket.data.wordChainRoom;
+
+            return ack({ success: true });
         });
 
         // ====================================
@@ -644,76 +789,19 @@ const registerWordChainSocket = (io) => {
     });
 
     return {
-        getRoomStatus: () => ({
-            totalRooms: rooms.size,
-
-            rooms: [...rooms.values()].map((room) => ({
-                pin: room.pin,
-                wordSetId: room.wordSetId,
-                players: room.players.size,
-                started: room.started,
-                finished: room.finished,
-            })),
-        }),
+        getRoomStatus() {
+            return {
+                totalRooms: rooms.size,
+                rooms: [...rooms.values()].map((room) => ({
+                    pin: room.pin,
+                    wordSetId: room.wordSetId,
+                    players: room.players.size,
+                    started: room.started,
+                    finished: room.finished,
+                })),
+            };
+        },
     };
 };
-
-// ========================================
-// LEAVE ROOM
-// ========================================
-
-function leaveRoom(io, socket, userId) {
-    const pin = socket.data.wordChainRoom;
-
-    if (!pin) return;
-
-    const room = rooms.get(pin);
-
-    if (!room) {
-        socket.leave(pin);
-        delete socket.data.wordChainRoom;
-        return;
-    }
-
-    if (room.hostId === userId) {
-        clearGameTimer(room);
-
-        io.to(pin).emit("room:closed", {
-            message: "Chủ phòng đã rời phòng.",
-        });
-
-        rooms.delete(pin);
-
-        socket.leave(pin);
-        delete socket.data.wordChainRoom;
-
-        return;
-    }
-
-    const player = room.players.get(userId);
-
-    if (player) {
-        room.players.delete(userId);
-
-        io.to(pin).emit("player:left", {
-            playerId: userId,
-            nickname: player.nickname,
-        });
-
-        emitPlayers(io, room);
-
-        if (room.started) {
-            if (room.players.size === 0) {
-                clearGameTimer(room);
-                rooms.delete(pin);
-            } else {
-                checkAllPlayersFinished(io, room);
-            }
-        }
-    }
-
-    socket.leave(pin);
-    delete socket.data.wordChainRoom;
-}
 
 module.exports = registerWordChainSocket;

@@ -16,10 +16,12 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 // ========================================
-// CORS CONFIGURATION
+// CORS
 // ========================================
 
-const allowedOrigins = (process.env.FRONTEND_URL || "*")
+const allowedOrigins = (
+    process.env.FRONTEND_URL || "*"
+)
     .split(",")
     .map((origin) => origin.trim().replace(/\/+$/, ""))
     .filter(Boolean);
@@ -28,17 +30,29 @@ const corsOrigin = allowedOrigins.includes("*")
     ? true
     : allowedOrigins;
 
-app.use(cors({
-    origin: corsOrigin,
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-}));
+app.use(
+    cors({
+        origin: corsOrigin,
+        methods: [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS",
+        ],
+        allowedHeaders: [
+            "Content-Type",
+            "Authorization",
+        ],
+        credentials: true,
+    })
+);
 
 app.use(express.json());
 
 // ========================================
-// SOCKET.IO CONFIGURATION
+// SOCKET.IO
 // ========================================
 
 const io = new Server(server, {
@@ -52,12 +66,11 @@ const io = new Server(server, {
 
     pingInterval: 25000,
     pingTimeout: 20000,
-
     connectTimeout: 20000,
 });
 
 // ========================================
-// SOCKET JWT AUTHENTICATION
+// JWT AUTHENTICATION
 // ========================================
 
 io.use((socket, next) => {
@@ -68,22 +81,16 @@ io.use((socket, next) => {
 
         const token = socket.handshake.auth?.token;
 
-        console.log("Có token:", Boolean(token));
-        console.log("Có JWT_SECRET:", Boolean(process.env.JWT_SECRET));
-
-        // Kiểm tra token
         if (!token) {
             console.log("AUTH ERROR: TOKEN_MISSING");
             return next(new Error("TOKEN_MISSING"));
         }
 
-        // Kiểm tra JWT_SECRET
         if (!process.env.JWT_SECRET) {
             console.log("AUTH ERROR: JWT_SECRET_MISSING");
             return next(new Error("JWT_SECRET_MISSING"));
         }
 
-        // Xác thực JWT
         const decoded = jwt.verify(
             token,
             process.env.JWT_SECRET
@@ -100,7 +107,6 @@ io.use((socket, next) => {
             return next(new Error("USER_ID_MISSING"));
         }
 
-        // Lưu thông tin người dùng
         socket.data.userId = String(userId);
         socket.data.user = decoded;
 
@@ -109,12 +115,8 @@ io.use((socket, next) => {
         console.log("=================================\n");
 
         return next();
-
     } catch (error) {
-        console.error("SOCKET AUTH FAILED:");
-        console.error("Error name:", error.name);
-        console.error("Error message:", error.message);
-        console.log("=================================\n");
+        console.error("SOCKET AUTH FAILED:", error.message);
 
         if (error.name === "TokenExpiredError") {
             return next(new Error("TOKEN_EXPIRED"));
@@ -145,7 +147,7 @@ const wordChainSocket = registerWordChainSocket(io);
 console.log("Word Chain Socket: READY");
 
 // ========================================
-// SOCKET CONNECTION EVENTS
+// GENERAL SOCKET EVENTS
 // ========================================
 
 io.on("connection", (socket) => {
@@ -168,7 +170,7 @@ io.on("connection", (socket) => {
 });
 
 // ========================================
-// HTTP ROUTES
+// HOME
 // ========================================
 
 app.get("/", (req, res) => {
@@ -181,6 +183,10 @@ app.get("/", (req, res) => {
         ],
     });
 });
+
+// ========================================
+// HEALTH
+// ========================================
 
 app.get("/health", (req, res) => {
     res.json({
@@ -272,7 +278,7 @@ server.listen(PORT, "0.0.0.0", () => {
 });
 
 // ========================================
-// HANDLE SERVER ERRORS
+// SERVER ERRORS
 // ========================================
 
 server.on("error", (error) => {
