@@ -100,8 +100,11 @@ module.exports = function registerWordChainSocket(io) {
         } else {
             // Trường hợp dữ liệu được lưu trong words JSONB
             const sourceWords = wordSet.words;
-
-            if (
+            console.log(
+                "[MATCHING] RAW WORD DATA:",
+                JSON.stringify(sourceWords.slice(0, 3), null, 2)
+            );
+                        if (
                 !Array.isArray(sourceWords) ||
                 sourceWords.length === 0
             ) {
