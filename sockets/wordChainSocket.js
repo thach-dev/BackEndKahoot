@@ -1,799 +1,1190 @@
 
-const crypto = require("crypto");
+const { randomInt } = require("crypto");
 
-const rooms = new Map();
+const wordChainService = require("../services/wordChainService");
 
 const MAX_PLAYERS = 20;
-const POINTS_PER_CORRECT = 10;
-const GAME_TIME = 180;
 
-// Tên sự kiện riêng của game Nối Từ
-const EVENTS = {
-    HOST_CREATE: "wordchain:host:create",
-    PLAYER_JOIN: "wordchain:player:join",
-    HOST_START: "wordchain:host:start",
-    PLAYER_MATCH: "wordchain:player:match",
-    PLAYER_FINISH: "wordchain:player:finish",
-    PLAYER_LEAVE: "wordchain:player:leave",
-    HOST_CLOSE: "wordchain:host:close",
+module.exports = function registerWordChainSocket(io) {
+    const rooms = new Map();
 
-    ROOM_PLAYERS: "wordchain:room:players",
-    GAME_STARTED: "wordchain:game:started",
-    GAME_FINISHED: "wordchain:game:finished",
-    GAME_ERROR: "wordchain:game:error",
-    MATCH_RESULT: "wordchain:match:result",
-    ROOM_CLOSED: "wordchain:room:closed",
-    PLAYER_LEFT: "wordchain:player:left",
-};
+    // =====================================================
+    // TẠO MÃ PHÒNG
+    // =====================================================
 
-const normalize = (value) => {
-    return String(value || "")
-        .normalize("NFC")
-        .trim()
-        .toLocaleLowerCase("vi-VN")
-        .replace(/\s+/g, " ");
-};
+    function makePin() {
+        let pin;
 
-const createPin = () => {
-    let pin;
+        do {
+            pin = String(randomInt(100000, 1000000));
+        } while (rooms.has(pin));
 
-    do {
-        pin = String(
-            crypto.randomInt(100000, 1000000)
-        );
-    } while (rooms.has(pin));
-
-    return pin;
-};
-
-// Tách phòng Nối Từ khỏi phòng Quiz
-const getSocketRoom = (pin) => `wordchain:${pin}`;
-
-const getPlayerId = (socket) => {
-    return String(socket.data.userId || socket.id);
-};
-
-const shuffle = (array) => {
-    const result = [...array];
-
-    for (let i = result.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-
-        [result[i], result[j]] = [
-            result[j],
-            result[i],
-        ];
+        return pin;
     }
 
-    return result;
-};
+    // =====================================================
+    // XÁO TRỘN
+    // =====================================================
 
-const getPublicPlayers = (room) => {
-    return [...room.players.values()]
-        .map((player) => ({
-            id: player.id,
-            nickname: player.nickname,
-            isHost: player.id === room.hostId,
-            score: player.score,
-            correctCount: player.correctCount,
-            wrongCount: player.wrongCount,
-            answeredCount: player.answeredQuestionIds.size,
-            totalQuestions: room.questions.length,
-            finished: player.finished,
-        }))
-        .sort((a, b) => b.score - a.score);
-};
+    function shuffle(array) {
+        const result = [...array];
 
-const emitPlayers = (io, room) => {
-    io.to(getSocketRoom(room.pin)).emit(
-        EVENTS.ROOM_PLAYERS,
-        getPublicPlayers(room)
-    );
-};
+        for (let i = result.length - 1; i > 0; i--) {
+            const j = randomInt(i + 1);
 
-const clearGameTimer = (room) => {
-    if (room?.gameTimer) {
-        clearTimeout(room.gameTimer);
-        room.gameTimer = null;
-    }
-};
-
-const getLeaderboard = (room) => {
-    return [...room.players.values()]
-        .map((player) => ({
-            id: player.id,
-            nickname: player.nickname,
-            score: player.score,
-            correctCount: player.correctCount,
-            wrongCount: player.wrongCount,
-            answeredCount: player.answeredQuestionIds.size,
-            totalQuestions: room.questions.length,
-        }))
-        .sort((a, b) => {
-            if (b.score !== a.score) {
-                return b.score - a.score;
-            }
-
-            return b.correctCount - a.correctCount;
-        });
-};
-
-const finishGame = (io, room, reason = "completed") => {
-    if (!room || !room.started) return;
-
-    clearGameTimer(room);
-
-    room.started = false;
-    room.finished = true;
-
-    io.to(getSocketRoom(room.pin)).emit(
-        EVENTS.GAME_FINISHED,
-        {
-            reason,
-            leaderboard: getLeaderboard(room),
-            players: getPublicPlayers(room),
+            [result[i], result[j]] = [
+                result[j],
+                result[i],
+            ];
         }
-    );
-};
 
-const checkAllPlayersFinished = (io, room) => {
-    if (!room.started) return;
-
-    const players = [...room.players.values()];
-
-    if (!players.length) return;
-
-    const allFinished = players.every(
-        (player) => player.finished
-    );
-
-    if (allFinished) {
-        finishGame(io, room, "completed");
-    }
-};
-
-const getPlayerGameData = (room) => {
-    return {
-        pin: room.pin,
-        wordSetTitle: room.wordSetTitle,
-
-        // Không gửi đáp án đúng xuống client.
-        questions: room.questions.map((question) => ({
-            id: question.id,
-            left_text: question.left_text,
-        })),
-
-        options: room.options.map((option) => ({
-            option_key: option.option_key,
-            right_text: option.right_text,
-        })),
-
-        totalQuestions: room.questions.length,
-        timeLimit: GAME_TIME,
-    };
-};
-
-function leaveRoom(io, socket, userId) {
-    const pin = socket.data.wordChainRoom;
-
-    if (!pin) return;
-
-    const room = rooms.get(pin);
-
-    if (!room) {
-        socket.leave(getSocketRoom(pin));
-        delete socket.data.wordChainRoom;
-        return;
+        return result;
     }
 
-    // Chủ phòng rời phòng
-    if (room.hostId === userId) {
-        clearGameTimer(room);
+    // =====================================================
+    // CHUẨN HÓA DỮ LIỆU GHÉP ĐÔI
+    //
+    // Hỗ trợ:
+    // { left_text, right_text }
+    // { question, answer }
+    // { prompt, answer }
+    // { term, definition }
+    // { word, meaning }
+    // { question, correct_answer }
+    //
+    // Hoặc dữ liệu questions/options đã có sẵn.
+    // =====================================================
 
-        io.to(getSocketRoom(pin)).emit(
-            EVENTS.ROOM_CLOSED,
-            {
-                message: "Chủ phòng đã rời phòng.",
-            }
-        );
-
-        rooms.delete(pin);
-
-        socket.leave(getSocketRoom(pin));
-        delete socket.data.wordChainRoom;
-
-        return;
-    }
-
-    const player = room.players.get(userId);
-
-    if (player) {
-        room.players.delete(userId);
-
-        io.to(getSocketRoom(pin)).emit(
-            EVENTS.PLAYER_LEFT,
-            {
-                playerId: userId,
-                nickname: player.nickname,
-            }
-        );
-
-        emitPlayers(io, room);
-
-        if (room.started) {
-            if (room.players.size === 0) {
-                clearGameTimer(room);
-                rooms.delete(pin);
-            } else {
-                checkAllPlayersFinished(io, room);
-            }
+    function buildMatchingData(wordSet) {
+        if (!wordSet) {
+            throw new Error(
+                "Không tìm thấy bộ dữ liệu."
+            );
         }
-    }
 
-    socket.leave(getSocketRoom(pin));
-    delete socket.data.wordChainRoom;
-}
+        let questions = [];
+        let options = [];
 
-const registerWordChainSocket = (io) => {
-    io.on("connection", (socket) => {
-        const userId = getPlayerId(socket);
+        // Trường hợp dữ liệu đã có questions/options
+        if (
+            Array.isArray(wordSet.questions) &&
+            Array.isArray(wordSet.options)
+        ) {
+            questions = wordSet.questions.map(
+                (item, index) => ({
+                    id: String(
+                        item.id ?? `Q${index + 1}`
+                    ).trim(),
 
-        console.log(
-            "WORD CHAIN SOCKET CONNECTED:",
-            socket.id,
-            userId
-        );
+                    left_text: String(
+                        item.left_text ?? item.question ?? ""
+                    ).trim(),
 
-        // ====================================
-        // HOST CREATE ROOM
-        // ====================================
+                    correct_option_key: String(
+                        item.correct_option_key ?? ""
+                    ).trim().toUpperCase(),
+                })
+            );
 
-        socket.on(EVENTS.HOST_CREATE, (payload = {}, callback) => {
-            const ack =
-                typeof callback === "function"
-                    ? callback
-                    : () => {};
+            options = wordSet.options.map(
+                (item, index) => ({
+                    option_key: String(
+                        item.option_key ?? `A${index + 1}`
+                    ).trim().toUpperCase(),
 
-            try {
-                const {
-                    wordSetId,
-                    wordSetTitle,
-                    gameData,
-                    questions,
-                    options,
-                    hostNickname,
-                } = payload;
+                    right_text: String(
+                        item.right_text ?? item.answer ?? ""
+                    ).trim(),
+                })
+            );
+        } else {
+            // Trường hợp dữ liệu được lưu trong words JSONB
+            const sourceWords = wordSet.words;
 
-                const sourceQuestions =
-                    gameData?.questions || questions;
+            if (
+                !Array.isArray(sourceWords) ||
+                sourceWords.length === 0
+            ) {
+                throw new Error(
+                    "Bộ dữ liệu không có nội dung ghép đôi."
+                );
+            }
 
-                const sourceOptions =
-                    gameData?.options || options;
-
-                if (
-                    !wordSetId ||
-                    !Array.isArray(sourceQuestions) ||
-                    !Array.isArray(sourceOptions)
-                ) {
-                    return ack({
-                        success: false,
-                        message: "Dữ liệu bộ ghép đôi không hợp lệ.",
-                    });
-                }
-
-                if (
-                    sourceQuestions.length < 1 ||
-                    sourceQuestions.length > 1000
-                ) {
-                    return ack({
-                        success: false,
-                        message: "Bộ câu hỏi phải có từ 1 đến 1000 câu.",
-                    });
-                }
-
-                if (
-                    sourceOptions.length < 1 ||
-                    sourceOptions.length > 1000
-                ) {
-                    return ack({
-                        success: false,
-                        message: "Bộ đáp án không hợp lệ.",
-                    });
-                }
-
-                const normalizedQuestions = [];
-                const questionIds = new Set();
-
-                for (const item of sourceQuestions) {
-                    const id = String(item.id || "").trim();
-
-                    const leftText = String(
-                        item.left_text || ""
-                    ).trim();
-
-                    const correctKey = String(
-                        item.correct_option_key ?? "0"
-                    ).trim();
-
-                    if (!id || !leftText) continue;
-
-                    if (questionIds.has(id)) {
-                        return ack({
-                            success: false,
-                            message: `Câu hỏi bị trùng ID: ${id}`,
-                        });
+            const pairs = sourceWords.map(
+                (item, index) => {
+                    if (
+                        !item ||
+                        typeof item !== "object" ||
+                        Array.isArray(item)
+                    ) {
+                        throw new Error(
+                            `Dữ liệu thứ ${index + 1} không phải một cặp ghép.`
+                        );
                     }
 
-                    questionIds.add(id);
-
-                    normalizedQuestions.push({
-                        id,
-                        left_text: leftText,
-                        correct_option_key: correctKey,
-                    });
-                }
-
-                const normalizedOptions = [];
-                const optionKeys = new Set();
-
-                for (const item of sourceOptions) {
-                    const key = String(
-                        item.option_key || ""
+                    const leftText = String(
+                        item.left_text ??
+                        item.question ??
+                        item.prompt ??
+                        item.term ??
+                        item.word ??
+                        ""
                     ).trim();
 
                     const rightText = String(
-                        item.right_text || ""
+                        item.right_text ??
+                        item.answer ??
+                        item.meaning ??
+                        item.definition ??
+                        item.translation ??
+                        item.correct_answer ??
+                        ""
                     ).trim();
 
-                    if (!key || !rightText) continue;
+                    if (!leftText || !rightText) {
+                        throw new Error(
+                            `Dữ liệu thứ ${index + 1} thiếu câu hỏi hoặc đáp án.`
+                        );
+                    }
 
-                    if (optionKeys.has(key)) {
+                    return {
+                        id: String(
+                            item.id ?? `Q${index + 1}`
+                        ).trim(),
+
+                        left_text: leftText,
+                        right_text: rightText,
+
+                        correct_option_key: String(
+                            item.correct_option_key ?? ""
+                        ).trim().toUpperCase(),
+                    };
+                }
+            );
+
+            const optionKeySet = new Set();
+
+            options = pairs.map((pair, index) => {
+                const optionKey = `A${index + 1}`;
+
+                optionKeySet.add(optionKey);
+
+                return {
+                    option_key: optionKey,
+                    right_text: pair.right_text,
+                };
+            });
+
+            questions = pairs.map((pair, index) => ({
+                id: pair.id,
+                left_text: pair.left_text,
+
+                correct_option_key:
+                    pair.correct_option_key || `A${index + 1}`,
+            }));
+        }
+
+        // =================================================
+        // KIỂM TRA SỐ LƯỢNG
+        // =================================================
+
+        if (
+            questions.length < 1 ||
+            questions.length > 1000
+        ) {
+            throw new Error(
+                "Bộ câu hỏi phải có từ 1 đến 1000 câu."
+            );
+        }
+
+        if (
+            options.length < 1 ||
+            options.length > 1000
+        ) {
+            throw new Error(
+                "Bộ đáp án phải có từ 1 đến 1000 đáp án."
+            );
+        }
+
+        // =================================================
+        // KIỂM TRA CÂU HỎI
+        // =================================================
+
+        const questionIds = new Set();
+
+        questions = questions.map((question, index) => {
+            const id = String(
+                question.id ?? ""
+            ).trim();
+
+            const leftText = String(
+                question.left_text ?? ""
+            ).trim();
+
+            const correctKey = String(
+                question.correct_option_key ?? ""
+            ).trim().toUpperCase();
+
+            if (!id || !leftText || !correctKey) {
+                throw new Error(
+                    `Câu hỏi thứ ${index + 1} không hợp lệ.`
+                );
+            }
+
+            if (questionIds.has(id)) {
+                throw new Error(
+                    `ID câu hỏi ${id} bị trùng.`
+                );
+            }
+
+            questionIds.add(id);
+
+            return {
+                id,
+                left_text: leftText,
+                correct_option_key: correctKey,
+            };
+        });
+
+        // =================================================
+        // KIỂM TRA ĐÁP ÁN
+        // =================================================
+
+        const optionKeys = new Set();
+
+        options = options.map((option, index) => {
+            const key = String(
+                option.option_key ?? ""
+            ).trim().toUpperCase();
+
+            const rightText = String(
+                option.right_text ?? ""
+            ).trim();
+
+            if (!key || !rightText) {
+                throw new Error(
+                    `Phương án thứ ${index + 1} không hợp lệ.`
+                );
+            }
+
+            if (optionKeys.has(key)) {
+                throw new Error(
+                    `Mã đáp án ${key} bị trùng.`
+                );
+            }
+
+            optionKeys.add(key);
+
+            return {
+                option_key: key,
+                right_text: rightText,
+            };
+        });
+
+        // =================================================
+        // KIỂM TRA ĐÁP ÁN ĐÚNG
+        // =================================================
+
+        for (const question of questions) {
+            if (
+                !optionKeys.has(
+                    question.correct_option_key
+                )
+            ) {
+                throw new Error(
+                    `Câu hỏi ${question.id} có đáp án không tồn tại: ${question.correct_option_key}`
+                );
+            }
+        }
+
+        return {
+            questions,
+            options,
+        };
+    }
+
+    // =====================================================
+    // DỮ LIỆU CÔNG KHAI
+    // KHÔNG GỬI ĐÁP ÁN ĐÚNG CHO NGƯỜI CHƠI
+    // =====================================================
+
+    function getPublicGameData(room) {
+        return {
+            gameType: "MATCHING",
+            title: room.title,
+
+            questions: room.questions.map(question => ({
+                id: question.id,
+                left_text: question.left_text,
+            })),
+
+            options: room.options.map(option => ({
+                option_key: option.option_key,
+                right_text: option.right_text,
+            })),
+        };
+    }
+
+    // =====================================================
+    // DANH SÁCH NGƯỜI CHƠI
+    // =====================================================
+
+    function getPublicPlayers(room) {
+        return [...room.players.values()].map(player => ({
+            id: player.id,
+            nickname: player.nickname,
+            isHost: false,
+            submitted: player.submitted,
+        }));
+    }
+
+    function broadcastPlayers(room) {
+        io.to(room.pin).emit(
+            "matching:room:players",
+            {
+                players: getPublicPlayers(room),
+            }
+        );
+    }
+
+    // =====================================================
+    // TÍNH ĐIỂM
+    // =====================================================
+
+    function calculateResult(room, answers) {
+        let correct = 0;
+        let wrong = 0;
+        let unanswered = 0;
+
+        const details = room.questions.map(question => {
+            const submittedKey = String(
+                answers?.[question.id] ?? ""
+            ).trim().toUpperCase();
+
+            const correctKey = String(
+                question.correct_option_key
+            ).toUpperCase();
+
+            const isCorrect =
+                submittedKey !== "" &&
+                submittedKey !== "0" &&
+                submittedKey === correctKey;
+
+            if (!submittedKey || submittedKey === "0") {
+                unanswered++;
+            } else if (isCorrect) {
+                correct++;
+            } else {
+                wrong++;
+            }
+
+            return {
+                questionId: question.id,
+                selectedOption: submittedKey || null,
+                correct: isCorrect,
+            };
+        });
+
+        return {
+            correct,
+            wrong,
+            unanswered,
+            total: room.questions.length,
+            score: correct * 100,
+            details,
+        };
+    }
+
+    // =====================================================
+    // KẾT THÚC TRẬN
+    // =====================================================
+
+    function finishGame(room) {
+        if (!room || room.finished) return;
+
+        room.finished = true;
+
+        const leaderboard = [...room.players.values()]
+            .map(player => ({
+                id: player.id,
+                nickname: player.nickname,
+                score: player.score,
+                submitted: player.submitted,
+
+                result: player.result
+                    ? {
+                        correct: player.result.correct,
+                        wrong: player.result.wrong,
+                        unanswered: player.result.unanswered,
+                        total: player.result.total,
+                    }
+                    : null,
+            }))
+            .sort((a, b) => b.score - a.score);
+
+        // Chỉ host nhận đáp án chuẩn
+        io.to(room.hostSocketId).emit(
+            "matching:host:answer-key",
+            {
+                answers: Object.fromEntries(
+                    room.questions.map(question => [
+                        question.id,
+                        question.correct_option_key,
+                    ])
+                ),
+            }
+        );
+
+        io.to(room.pin).emit(
+            "matching:game:finished",
+            {
+                leaderboard,
+            }
+        );
+
+        console.log(
+            "[MATCHING] GAME FINISHED:",
+            room.pin
+        );
+    }
+
+    function checkAllSubmitted(room) {
+        if (!room || room.finished) return;
+
+        if (room.players.size === 0) return;
+
+        const allSubmitted = [
+            ...room.players.values(),
+        ].every(player => player.submitted);
+
+        if (allSubmitted) {
+            finishGame(room);
+        }
+    }
+
+    // =====================================================
+    // XÓA PHÒNG
+    // =====================================================
+
+    function closeRoom(room, message) {
+        if (!room) return;
+
+        io.to(room.pin).emit(
+            "matching:room:closed",
+            {
+                message,
+            }
+        );
+
+        for (const player of room.players.values()) {
+            const playerSocket = io.sockets.sockets.get(
+                player.id
+            );
+
+            if (playerSocket) {
+                playerSocket.data.matchingPlayerPin = null;
+                playerSocket.leave(room.pin);
+            }
+        }
+
+        const hostSocket = io.sockets.sockets.get(
+            room.hostSocketId
+        );
+
+        if (hostSocket) {
+            hostSocket.data.matchingHostPin = null;
+            hostSocket.leave(room.pin);
+        }
+
+        rooms.delete(room.pin);
+
+        console.log(
+            "[MATCHING] ROOM CLOSED:",
+            room.pin
+        );
+    }
+
+    // =====================================================
+    // SOCKET CONNECTION
+    // =====================================================
+
+    io.on("connection", socket => {
+        console.log("[MATCHING] CLIENT CONNECTED:", {
+            socketId: socket.id,
+            userId: socket.data.userId,
+            transport: socket.conn.transport.name,
+        });
+
+        socket.onAny(event => {
+            console.log("[MATCHING] EVENT RECEIVED:", {
+                event,
+                socketId: socket.id,
+                userId: socket.data.userId,
+            });
+        });
+
+        // =================================================
+        // 1. HOST CREATE ROOM
+        // =================================================
+
+        socket.on(
+            "matching:host:create",
+            async (data = {}, callback = () => {}) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
+
+                const wordSetId = data?.wordSetId;
+
+                console.log(
+                    "[MATCHING] CREATE REQUEST RECEIVED:",
+                    {
+                        socketId: socket.id,
+                        userId: socket.data.userId,
+                        wordSetId,
+                    }
+                );
+
+                try {
+                    if (!wordSetId) {
+                        throw new Error(
+                            "Vui lòng chọn bộ dữ liệu."
+                        );
+                    }
+
+                    if (socket.data.matchingHostPin) {
+                        const oldRoom = rooms.get(
+                            socket.data.matchingHostPin
+                        );
+
+                        if (oldRoom) {
+                            closeRoom(
+                                oldRoom,
+                                "Chủ phòng đã tạo phòng mới."
+                            );
+                        }
+                    }
+
+                    console.log(
+                        "[MATCHING] STEP 1: GET WORD SET"
+                    );
+
+                    const wordSet =
+                        await wordChainService.getWordSetForHost(
+                            wordSetId
+                        );
+
+                    console.log(
+                        "[MATCHING] STEP 2: WORD SET LOADED:",
+                        {
+                            title: wordSet.title,
+                            totalWords: wordSet.words?.length,
+                        }
+                    );
+
+                    const validated = buildMatchingData(
+                        wordSet
+                    );
+
+                    console.log(
+                        "[MATCHING] STEP 3: VALIDATION SUCCESS:",
+                        {
+                            questions: validated.questions.length,
+                            options: validated.options.length,
+                        }
+                    );
+
+                    const pin = makePin();
+
+                    const room = {
+                        pin,
+                        title: wordSet.title || "Bộ ghép đôi",
+                        wordSetId,
+
+                        hostSocketId: socket.id,
+
+                        players: new Map(),
+
+                        questions: shuffle(
+                            validated.questions
+                        ),
+
+                        options: shuffle(
+                            validated.options
+                        ),
+
+                        started: false,
+                        finished: false,
+                    };
+
+                    rooms.set(pin, room);
+
+                    await socket.join(pin);
+
+                    socket.data.matchingHostPin = pin;
+
+                    console.log(
+                        "[MATCHING] STEP 4: ROOM CREATED:",
+                        {
+                            pin,
+                            title: room.title,
+                            questions: room.questions.length,
+                            options: room.options.length,
+                        }
+                    );
+
+                    ack({
+                        ok: true,
+                        pin,
+                        title: room.title,
+                        totalQuestions: room.questions.length,
+                        totalOptions: room.options.length,
+                    });
+                } catch (error) {
+                    console.error(
+                        "[MATCHING] CREATE ROOM FAILED:",
+                        {
+                            message: error.message,
+                            stack: error.stack,
+                            wordSetId,
+                            socketId: socket.id,
+                        }
+                    );
+
+                    ack({
+                        ok: false,
+                        message:
+                            error.message ||
+                            "Không thể tạo phòng.",
+                    });
+                }
+            }
+        );
+
+        // =================================================
+        // 2. PLAYER JOIN
+        // =================================================
+
+        socket.on(
+            "matching:player:join",
+            async (
+                { pin, nickname } = {},
+                callback = () => {}
+            ) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
+
+                try {
+                    pin = String(pin || "").trim();
+
+                    nickname = String(nickname || "")
+                        .trim()
+                        .slice(0, 20);
+
+                    const room = rooms.get(pin);
+
+                    if (!room) {
                         return ack({
-                            success: false,
-                            message: `Mã đáp án bị trùng: ${key}`,
+                            ok: false,
+                            message: "Mã phòng không tồn tại.",
                         });
                     }
 
-                    optionKeys.add(key);
+                    if (room.started || room.finished) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Trận đấu đã bắt đầu hoặc kết thúc.",
+                        });
+                    }
 
-                    normalizedOptions.push({
-                        option_key: key,
-                        right_text: rightText,
-                    });
-                }
+                    if (!nickname) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Vui lòng nhập nickname.",
+                        });
+                    }
 
-                if (
-                    !normalizedQuestions.length ||
-                    !normalizedOptions.length
-                ) {
-                    return ack({
-                        success: false,
-                        message: "Không có đủ câu hỏi hoặc đáp án.",
-                    });
-                }
+                    if (room.players.size >= MAX_PLAYERS) {
+                        return ack({
+                            ok: false,
+                            message: "Phòng đã đủ người.",
+                        });
+                    }
 
-                for (const question of normalizedQuestions) {
                     if (
-                        question.correct_option_key !== "0" &&
-                        !optionKeys.has(question.correct_option_key)
+                        socket.data.matchingPlayerPin &&
+                        socket.data.matchingPlayerPin !== pin
                     ) {
                         return ack({
-                            success: false,
+                            ok: false,
                             message:
-                                `Câu ${question.id} có mã đáp án không tồn tại.`,
+                                "Bạn đang ở một phòng khác.",
                         });
                     }
+
+                    // Tránh người chơi tham gia lặp
+                    if (room.players.has(socket.id)) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Bạn đã tham gia phòng này.",
+                        });
+                    }
+
+                    const player = {
+                        id: socket.id,
+                        nickname,
+                        submitted: false,
+                        score: 0,
+                        result: null,
+                    };
+
+                    room.players.set(socket.id, player);
+
+                    await socket.join(pin);
+
+                    socket.data.matchingPlayerPin = pin;
+
+                    broadcastPlayers(room);
+
+                    ack({
+                        ok: true,
+                        pin,
+                        playerId: socket.id,
+                        nickname,
+                    });
+                } catch (error) {
+                    console.error(
+                        "[MATCHING] PLAYER JOIN ERROR:",
+                        error
+                    );
+
+                    ack({
+                        ok: false,
+                        message: "Không thể tham gia phòng.",
+                    });
                 }
-
-                const pin = createPin();
-
-                const room = {
-                    pin,
-                    hostId: userId,
-                    wordSetId,
-                    wordSetTitle: wordSetTitle || "Bộ ghép đôi",
-
-                    questions: normalizedQuestions,
-                    options: normalizedOptions,
-
-                    players: new Map(),
-
-                    started: false,
-                    finished: false,
-                    gameTimer: null,
-                };
-
-                room.players.set(userId, {
-                    id: userId,
-                    nickname: String(
-                        hostNickname || "Chủ phòng"
-                    ).trim(),
-                    score: 0,
-                    correctCount: 0,
-                    wrongCount: 0,
-                    answeredQuestionIds: new Set(),
-                    finished: false,
-                });
-
-                rooms.set(pin, room);
-
-                socket.join(getSocketRoom(pin));
-                socket.data.wordChainRoom = pin;
-
-                emitPlayers(io, room);
-
-                console.log("WORD CHAIN ROOM CREATED:", pin);
-
-                return ack({
-                    success: true,
-                    pin,
-                    wordSetTitle: room.wordSetTitle,
-                    players: getPublicPlayers(room),
-                });
-            } catch (error) {
-                console.error("WORD CHAIN HOST CREATE ERROR:", error);
-
-                return ack({
-                    success: false,
-                    message: error.message || "Không thể tạo phòng.",
-                });
             }
-        });
+        );
 
-        // ====================================
-        // PLAYER JOIN
-        // ====================================
+        // =================================================
+        // 3. HOST START GAME
+        // =================================================
 
-        socket.on(EVENTS.PLAYER_JOIN, (payload = {}, callback) => {
-            const ack =
-                typeof callback === "function"
-                    ? callback
-                    : () => {};
+        socket.on(
+            "matching:host:start",
+            ({ pin } = {}, callback = () => {}) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
 
-            try {
-                const pin = String(payload.pin || "").trim();
-                const nickname = String(
-                    payload.nickname || ""
-                ).trim();
+                try {
+                    const room = rooms.get(
+                        String(
+                            pin || socket.data.matchingHostPin || ""
+                        ).trim()
+                    );
 
-                const room = rooms.get(pin);
+                    if (
+                        !room ||
+                        room.hostSocketId !== socket.id
+                    ) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Không có quyền điều khiển phòng.",
+                        });
+                    }
 
-                if (!room) {
-                    return ack({
-                        success: false,
-                        message: "Phòng không tồn tại.",
+                    if (room.started || room.finished) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Trận đấu đã bắt đầu hoặc kết thúc.",
+                        });
+                    }
+
+                    if (room.questions.length < 1 || room.options.length < 1) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Bộ dữ liệu không có câu hỏi hoặc đáp án.",
+                        });
+                    }
+
+                    if (room.players.size < 1) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Cần ít nhất một người chơi.",
+                        });
+                    }
+
+                    room.started = true;
+
+                    // Không gửi đáp án đúng xuống client
+                    io.to(room.pin).emit(
+                        "matching:game:started",
+                        {
+                            ...getPublicGameData(room),
+                            totalQuestions: room.questions.length,
+                            totalOptions: room.options.length,
+                        }
+                    );
+
+                    console.log(
+                        "[MATCHING] GAME STARTED:",
+                        room.pin
+                    );
+
+                    ack({
+                        ok: true,
+                    });
+                } catch (error) {
+                    console.error(
+                        "[MATCHING] HOST START ERROR:",
+                        error
+                    );
+
+                    ack({
+                        ok: false,
+                        message: "Không thể bắt đầu trận đấu.",
                     });
                 }
-
-                if (room.started || room.finished) {
-                    return ack({
-                        success: false,
-                        message: "Trận đấu đã bắt đầu hoặc kết thúc.",
-                    });
-                }
-
-                if (!nickname || nickname.length > 24) {
-                    return ack({
-                        success: false,
-                        message: "Tên người chơi phải từ 1 đến 24 ký tự.",
-                    });
-                }
-
-                if (room.players.has(userId)) {
-                    return ack({
-                        success: false,
-                        message: "Bạn đã ở trong phòng.",
-                    });
-                }
-
-                if (room.players.size >= MAX_PLAYERS) {
-                    return ack({
-                        success: false,
-                        message: "Phòng đã đủ người.",
-                    });
-                }
-
-                const oldPin = socket.data.wordChainRoom;
-
-                if (oldPin && oldPin !== pin) {
-                    leaveRoom(io, socket, userId);
-                }
-
-                room.players.set(userId, {
-                    id: userId,
-                    nickname,
-                    score: 0,
-                    correctCount: 0,
-                    wrongCount: 0,
-                    answeredQuestionIds: new Set(),
-                    finished: false,
-                });
-
-                socket.join(getSocketRoom(pin));
-                socket.data.wordChainRoom = pin;
-
-                emitPlayers(io, room);
-
-                return ack({
-                    success: true,
-                    pin,
-                    players: getPublicPlayers(room),
-                });
-            } catch (error) {
-                console.error("WORD CHAIN PLAYER JOIN ERROR:", error);
-
-                return ack({
-                    success: false,
-                    message: "Không thể tham gia phòng.",
-                });
             }
-        });
+        );
 
-        // ====================================
-        // HOST START GAME
-        // ====================================
+        // =================================================
+        // 4. PLAYER SUBMIT
+        // =================================================
 
-        socket.on(EVENTS.HOST_START, (payload = {}, callback) => {
-            const ack =
-                typeof callback === "function"
-                    ? callback
-                    : () => {};
+        socket.on(
+            "matching:player:submit",
+            (
+                { pin, answers } = {},
+                callback = () => {}
+            ) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
 
-            const pin = String(
-                payload.pin || socket.data.wordChainRoom || ""
-            ).trim();
+                try {
+                    const room = rooms.get(
+                        String(pin || "").trim()
+                    );
 
-            const room = rooms.get(pin);
+                    if (
+                        !room ||
+                        socket.data.matchingPlayerPin !== room.pin ||
+                        !room.started ||
+                        room.finished
+                    ) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Không thể gửi kết quả.",
+                        });
+                    }
 
-            if (!room || room.hostId !== userId) {
-                return ack({
-                    success: false,
-                    message: "Bạn không phải chủ phòng.",
-                });
-            }
+                    const player = room.players.get(
+                        socket.id
+                    );
 
-            if (room.started || room.finished) {
-                return ack({
-                    success: false,
-                    message: "Trận đấu đã bắt đầu hoặc kết thúc.",
-                });
-            }
+                    if (!player) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Bạn không thuộc phòng này.",
+                        });
+                    }
 
-            if (room.players.size < 2) {
-                return ack({
-                    success: false,
-                    message: "Cần ít nhất 2 người chơi.",
-                });
-            }
+                    if (player.submitted) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Bạn đã nộp bài rồi.",
+                        });
+                    }
 
-            room.started = true;
+                    if (
+                        !answers ||
+                        typeof answers !== "object" ||
+                        Array.isArray(answers)
+                    ) {
+                        return ack({
+                            ok: false,
+                            message:
+                                "Dữ liệu ghép nối không hợp lệ.",
+                        });
+                    }
 
-            room.questions = shuffle(room.questions);
-            room.options = shuffle(room.options);
+                    const validQuestionIds = new Set(
+                        room.questions.map(
+                            question => question.id
+                        )
+                    );
 
-            for (const player of room.players.values()) {
-                player.score = 0;
-                player.correctCount = 0;
-                player.wrongCount = 0;
-                player.answeredQuestionIds = new Set();
-                player.finished = false;
-            }
+                    const validOptionKeys = new Set(
+                        room.options.map(
+                            option => option.option_key
+                        )
+                    );
 
-            io.to(getSocketRoom(pin)).emit(
-                EVENTS.GAME_STARTED,
-                getPlayerGameData(room)
-            );
+                    for (const [
+                        questionId,
+                        optionKey,
+                    ] of Object.entries(answers)) {
+                        if (!validQuestionIds.has(String(questionId))) {
+                            return ack({
+                                ok: false,
+                                message:
+                                    "Có câu hỏi không hợp lệ.",
+                            });
+                        }
 
-            room.gameTimer = setTimeout(() => {
-                finishGame(io, room, "time_up");
-            }, GAME_TIME * 1000);
+                        const selected = String(
+                            optionKey
+                        ).trim().toUpperCase();
 
-            emitPlayers(io, room);
+                        if (
+                            selected !== "0" &&
+                            !validOptionKeys.has(selected)
+                        ) {
+                            return ack({
+                                ok: false,
+                                message:
+                                    "Có đáp án không hợp lệ.",
+                            });
+                        }
+                    }
 
-            return ack({ success: true });
-        });
+                    const result = calculateResult(
+                        room,
+                        answers
+                    );
 
-        // ====================================
-        // PLAYER MATCH
-        // ====================================
+                    player.submitted = true;
+                    player.score = result.score;
+                    player.result = result;
 
-        socket.on(EVENTS.PLAYER_MATCH, (payload = {}, callback) => {
-            const ack =
-                typeof callback === "function"
-                    ? callback
-                    : () => {};
+                    ack({
+                        ok: true,
+                        result: {
+                            correct: result.correct,
+                            wrong: result.wrong,
+                            unanswered: result.unanswered,
+                            total: result.total,
+                            score: result.score,
+                        },
+                    });
 
-            try {
-                const pin = socket.data.wordChainRoom;
-                const room = rooms.get(pin);
+                    io.to(room.hostSocketId).emit(
+                        "matching:host:submission",
+                        {
+                            playerId: socket.id,
+                            nickname: player.nickname,
+                            submitted: true,
+                        }
+                    );
 
-                if (!room || !room.started) {
-                    return ack({
-                        success: false,
-                        message: "Trận đấu chưa bắt đầu.",
+                    broadcastPlayers(room);
+
+                    checkAllSubmitted(room);
+                } catch (error) {
+                    console.error(
+                        "[MATCHING] PLAYER SUBMIT ERROR:",
+                        error
+                    );
+
+                    ack({
+                        ok: false,
+                        message:
+                            "Không thể gửi kết quả.",
                     });
                 }
+            }
+        );
 
-                const player = room.players.get(userId);
+        // =================================================
+        // 5. HOST FINISH
+        // =================================================
 
-                if (!player) {
-                    return ack({
-                        success: false,
-                        message: "Bạn không có trong phòng.",
-                    });
-                }
+        socket.on(
+            "matching:host:finish",
+            ({ pin } = {}, callback = () => {}) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
 
-                if (player.finished) {
-                    return ack({
-                        success: false,
-                        message: "Bạn đã hoàn thành lượt chơi.",
-                    });
-                }
-
-                const questionId = String(
-                    payload.questionId || ""
-                ).trim();
-
-                const optionKey = String(
-                    payload.optionKey || ""
-                ).trim();
-
-                const question = room.questions.find(
-                    (item) => item.id === questionId
+                const room = rooms.get(
+                    String(
+                        pin || socket.data.matchingHostPin || ""
+                    ).trim()
                 );
-
-                const option = room.options.find(
-                    (item) => item.option_key === optionKey
-                );
-
-                if (!question || !option) {
-                    return ack({
-                        success: false,
-                        message: "Cặp ghép không hợp lệ.",
-                    });
-                }
-
-                if (player.answeredQuestionIds.has(questionId)) {
-                    return ack({
-                        success: false,
-                        message: "Câu hỏi này đã được trả lời.",
-                    });
-                }
-
-                player.answeredQuestionIds.add(questionId);
-
-                const isCorrect =
-                    question.correct_option_key !== "0" &&
-                    question.correct_option_key === optionKey;
-
-                if (isCorrect) {
-                    player.score += POINTS_PER_CORRECT;
-                    player.correctCount += 1;
-                } else {
-                    player.wrongCount += 1;
-                }
 
                 if (
-                    player.answeredQuestionIds.size >=
-                    room.questions.length
+                    !room ||
+                    room.hostSocketId !== socket.id
                 ) {
-                    player.finished = true;
+                    return ack({
+                        ok: false,
+                        message:
+                            "Không có quyền kết thúc trận.",
+                    });
                 }
 
-                const result = {
-                    success: true,
-                    questionId,
-                    optionKey,
-                    isCorrect,
-                    points: isCorrect ? POINTS_PER_CORRECT : 0,
-                    score: player.score,
-                    correctCount: player.correctCount,
-                    wrongCount: player.wrongCount,
-                    answeredCount: player.answeredQuestionIds.size,
-                    totalQuestions: room.questions.length,
-                    finished: player.finished,
-                };
-
-                socket.emit(EVENTS.MATCH_RESULT, result);
-
-                emitPlayers(io, room);
-
-                ack(result);
-
-                checkAllPlayersFinished(io, room);
-            } catch (error) {
-                console.error("WORD CHAIN PLAYER MATCH ERROR:", error);
+                finishGame(room);
 
                 ack({
-                    success: false,
-                    message: "Không thể kiểm tra cặp ghép.",
+                    ok: true,
                 });
             }
-        });
+        );
 
-        // ====================================
-        // PLAYER FINISH
-        // ====================================
+        // =================================================
+        // 6. PLAYER LEAVE
+        // =================================================
 
-        socket.on(EVENTS.PLAYER_FINISH, () => {
-            const pin = socket.data.wordChainRoom;
-            const room = rooms.get(pin);
+        socket.on(
+            "matching:player:leave",
+            ({ pin } = {}, callback = () => {}) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
 
-            if (!room || !room.started) return;
+                const room = rooms.get(
+                    String(
+                        pin || socket.data.matchingPlayerPin || ""
+                    ).trim()
+                );
 
-            const player = room.players.get(userId);
+                if (
+                    room &&
+                    room.players.has(socket.id)
+                ) {
+                    room.players.delete(socket.id);
 
-            if (!player) return;
+                    socket.leave(room.pin);
 
-            player.finished = true;
+                    broadcastPlayers(room);
 
-            emitPlayers(io, room);
-            checkAllPlayersFinished(io, room);
-        });
-
-        // ====================================
-        // PLAYER LEAVE
-        // ====================================
-
-        socket.on(EVENTS.PLAYER_LEAVE, () => {
-            leaveRoom(io, socket, userId);
-        });
-
-        // ====================================
-        // HOST CLOSE ROOM
-        // ====================================
-
-        socket.on(EVENTS.HOST_CLOSE, (payload = {}, callback) => {
-            const ack =
-                typeof callback === "function"
-                    ? callback
-                    : () => {};
-
-            const pin = String(
-                payload.pin || socket.data.wordChainRoom || ""
-            ).trim();
-
-            const room = rooms.get(pin);
-
-            if (!room || room.hostId !== userId) {
-                return ack({
-                    success: false,
-                    message: "Bạn không phải chủ phòng.",
-                });
-            }
-
-            clearGameTimer(room);
-
-            io.to(getSocketRoom(pin)).emit(
-                EVENTS.ROOM_CLOSED,
-                {
-                    message: "Chủ phòng đã đóng phòng.",
+                    checkAllSubmitted(room);
                 }
-            );
 
-            rooms.delete(pin);
+                socket.data.matchingPlayerPin = null;
 
-            socket.leave(getSocketRoom(pin));
-            delete socket.data.wordChainRoom;
+                ack({
+                    ok: true,
+                });
+            }
+        );
 
-            return ack({ success: true });
-        });
+        // =================================================
+        // 7. HOST CLOSE ROOM
+        // =================================================
 
-        // ====================================
-        // DISCONNECT
-        // ====================================
+        socket.on(
+            "matching:host:close",
+            ({ pin } = {}, callback = () => {}) => {
+                const ack =
+                    typeof callback === "function"
+                        ? callback
+                        : () => {};
+
+                const room = rooms.get(
+                    String(
+                        pin || socket.data.matchingHostPin || ""
+                    ).trim()
+                );
+
+                if (
+                    !room ||
+                    room.hostSocketId !== socket.id
+                ) {
+                    return ack({
+                        ok: false,
+                        message:
+                            "Không có quyền đóng phòng.",
+                    });
+                }
+
+                closeRoom(
+                    room,
+                    "Chủ phòng đã đóng phòng."
+                );
+
+                ack({
+                    ok: true,
+                });
+            }
+        );
+
+        // =================================================
+        // 8. DISCONNECT
+        // =================================================
 
         socket.on("disconnect", () => {
-            leaveRoom(io, socket, userId);
+            // Người chơi mất kết nối
+            const playerPin =
+                socket.data.matchingPlayerPin;
+
+            const playerRoom = rooms.get(playerPin);
+
+            if (
+                playerRoom &&
+                playerRoom.players.has(socket.id)
+            ) {
+                playerRoom.players.delete(socket.id);
+
+                broadcastPlayers(playerRoom);
+
+                checkAllSubmitted(playerRoom);
+
+                console.log(
+                    "[MATCHING] PLAYER DISCONNECTED:",
+                    socket.id
+                );
+            }
+
+            // Chủ phòng mất kết nối
+            const hostPin =
+                socket.data.matchingHostPin;
+
+            const hostRoom = rooms.get(hostPin);
+
+            if (
+                hostRoom &&
+                hostRoom.hostSocketId === socket.id
+            ) {
+                closeRoom(
+                    hostRoom,
+                    "Chủ phòng đã mất kết nối."
+                );
+            }
         });
     });
+
+    console.log(
+        "[MATCHING] Socket handler registered."
+    );
 
     return {
         getRoomStatus() {
             return {
                 totalRooms: rooms.size,
-                rooms: [...rooms.values()].map((room) => ({
+
+                rooms: [...rooms.values()].map(room => ({
                     pin: room.pin,
+                    title: room.title,
                     wordSetId: room.wordSetId,
                     players: room.players.size,
                     started: room.started,
@@ -803,5 +1194,3 @@ const registerWordChainSocket = (io) => {
         },
     };
 };
-
-module.exports = registerWordChainSocket;
